@@ -149,8 +149,21 @@ class OlymtradeBot:
     async def stop(self):
         if self._ctx:
             try:
-                await self._ctx.storage_state(path=SESSION_FILE)
-                log.info("Browser session saved")
+                try:
+                    # Prefer direct write via Playwright API (may open a new target internally)
+                    await self._ctx.storage_state(path=SESSION_FILE)
+                    log.info("Browser session saved")
+                except Exception:
+                    # Fallback: obtain state dict and write it without asking Playwright to open targets
+                    state = await self._ctx.storage_state()
+                    try:
+                        import json
+
+                        with open(SESSION_FILE, "w", encoding="utf-8") as fh:
+                            json.dump(state, fh)
+                        log.info("Browser session saved (fallback) to %s", SESSION_FILE)
+                    except Exception as e:
+                        log.warning(f"Could not write browser session fallback: {e}")
             except Exception as e:
                 log.warning(f"Could not save browser session: {e}")
         if self._browser:
@@ -173,6 +186,38 @@ class OlymtradeBot:
             return state in ("interactive", "complete")
         except Exception:
             return False
+
+    async def _ensure_chart_visible_and_close_panels(self, timeout: float = 5.0) -> dict:
+        """Ensure chart is visible: close trades/tech panels and verify timeframe.
+
+        Returns a dict with keys: verified(bool), closed_panels(list), reason(str).
+        """
+        page = self._page
+        closed = []
+        try:
+            # Close trades panel if visible
+            trades_close = page.locator('[data-test="cor-w-panel-trades"] [data-test="cor-w-panel-close"]')
+            if await trades_close.count() and await trades_close.is_visible():
+                try:
+                    await trades_close.click(timeout=1500)
+                    closed.append('trades_panel')
+                except Exception:
+                    pass
+            # Close tech analysis panel if visible
+            tech_close = page.locator('[data-test="cor-w-panel-techAnalysisList"] [data-test="cor-w-panel-close"]')
+            if await tech_close.count() and await tech_close.is_visible():
+                try:
+                    await tech_close.click(timeout=1500)
+                    closed.append('tech_panel')
+                except Exception:
+                    pass
+            # After closing, verify timeframe selector is visible
+            tf = page.locator('[data-test="TimeFrameSelector.selected"]')
+            if not await tf.count() or not await tf.is_visible():
+                return {"verified": False, "closed_panels": closed, "reason": "timeframe_unavailable"}
+            return {"verified": True, "closed_panels": closed, "reason": "ok"}
+        except Exception as exc:
+            return {"verified": False, "closed_panels": closed, "reason": f"exception:{type(exc).__name__}"}
 
     async def login(self) -> bool:
         """Log in with email/password, or fallback to manual Google Sign-In."""
@@ -707,6 +752,21 @@ class OlymtradeBot:
             emit("[NativeHistory] request=unavailable timeframe=%s purpose=%s timeout_seconds=%s",
                  period, purpose, response_timeout + 0.2)
             return None
+
+    async def resubscribe_quote_stream(self) -> bool:
+        """Attempt to re-establish the broker's WS quote stream by toggling asset selection."""
+        try:
+            # Try cancel/reopen the asset tab to force ws reconnection
+            btn = self._page.locator('[data-test="assets-tabs-tab-selected"]')
+            if await btn.count():
+                await btn.click(timeout=1500)
+                await asyncio.sleep(0.2)
+            # Press escape to dismiss modals
+            await self._page.keyboard.press('Escape')
+            await asyncio.sleep(0.2)
+            return True
+        except Exception:
+            return False
 
     async def _request_native_candles(self, asset: str, period: int, count: int,
                                       *, response_timeout: float, purpose: str):

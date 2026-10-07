@@ -1,28 +1,21 @@
-"""BUY/SELL demo strategy with one-second provisional market monitoring.
-
-Completed 30s candles drive entry decisions by default (60s is optional).
-Existing directional entry rules and matching 5m trend must confirm each 60s order.
-"""
+"""Part B deterministic one-minute strategy with existing browser execution."""
 
 import asyncio
-import inspect
 import logging
 import os
 import sys
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-import shutil
 from pathlib import Path
-import numpy as np
 import argparse
 import json
 import math
 from contextlib import nullcontext
 from bot.process_lock import ProcessLock
-from strategies.closed_candle import evaluate_both, evaluate_demo_continuation
+from utils.safe_io import safe_write_csv_row
+from strategies.part_b import evaluate_strategy
 from strategies.live_monitor import analyze_forming
-from strategies.trend_filter import evaluate_five_minute_trend
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -30,23 +23,17 @@ from config import settings
 from bot.risk import RiskManager, TradeRecord
 from bot.browser import OlymtradeBot
 from bot.chart_indicators import configure_strategy_chart, reconcile_selected_strategy_chart
+from datetime import datetime
+import os as _os
 from models.predictor import Signal
 from agents.agent_multi_timeframe import MultiTimeframeAgent
-from agents.agent_rl_learning import RLFeedbackAgent
 from agents.agent_pipeline_supervisor import PipelineSupervisorAgent
-from agents.agent_regime_detector import RegimeDetector
 from agents.agent_asset_selector import AssetSelectorAgent
-from agents.chart_analyzer import ChartAnalyzer, AnalysisResult
-from agents.multi_timeframe_consensus import MultiTimeframeConsensusAnalyzer
-
-BEAR_REGIMES = {"BEAR_TREND", "HIGH_VOL_DOWN", "BREAKOUT_DOWN"}
-BULL_REGIMES = {"BULL_TREND",  "HIGH_VOL_UP",  "BREAKOUT_UP"}
 
 # ── Risk constants (from your strategy plan) ──────────────────────────────────
 TRADE_AMOUNT        = 200.0    # $200 fixed per trade
 DAILY_LOSS_LIMIT    = 2000.0   # $2,000 circuit breaker
-MIN_CONFIDENCE      = 0.60     # 60% minimum (strategy doc: 60–65%)
-MIN_CONFLUENCES     = 5        # require 5/9 indicators to agree
+MIN_CONFIDENCE      = 0.75     # Fixed Part B confidence threshold
 MAX_TRADES_PER_DAY  = 20       # hard cap
 PAYOUT_MINIMUM      = 0.80     # skip assets below 80% payout
 FTT_DURATION_S      = 60       # 1 minute trades
@@ -75,12 +62,6 @@ def _rotate_daily_log(log_path: str):
 log = logging.getLogger("multi_agent_orchestrator")
 
 
-def select_entry_evaluator():
-    if getattr(settings, "DEMO_STRATEGY_ENABLED", False):
-        return evaluate_demo_continuation
-    return evaluate_both
-
-
 class MonitorConsoleFormatter(logging.Formatter):
     """Keep the terminal readable; file handlers retain the full JSON evidence."""
 
@@ -99,6 +80,17 @@ class MonitorConsoleFormatter(logging.Formatter):
                 timing = data.get("entry_timing", {})
                 window = {True: "open", False: "closed"}.get(timing.get("within_window"), "unknown")
                 stale_timeframes = ",".join(f"{period}s" for period in data.get("stale_closed_timeframes", [])) or "none"
+                # Represent failed rules fully for easier debugging.
+                failed_rules = gate.get('failed_rules') or []
+                failed_rules_str = json.dumps(failed_rules)
+                # Prefer explicit top-level then gate trend/entry close fields; fall back to closed_candles
+                # Ensure we print CLOSE PRICES for the closed candles, not timestamps.
+                trend_close = data.get('trend_close') or gate.get('trend_close')
+                if trend_close is None:
+                    trend_close = data.get('closed_candles', {}).get('30', {}).get('close')
+                entry_close = data.get('entry_close') or gate.get('entry_close')
+                if entry_close is None:
+                    entry_close = data.get('closed_candles', {}).get(str(entry_seconds), {}).get('close')
                 message = (
                     f"[Decision] {data['decision']} stage={data['blocking_stage']} "
                     f"direction={data.get('direction') or 'none'} "
@@ -108,14 +100,16 @@ class MonitorConsoleFormatter(logging.Formatter):
                     f"quote_age_seconds={seconds(data.get('quote_age_seconds'))} "
                     f"closed_history={data.get('closed_candle_status', 'unknown')} "
                     f"stale_timeframes={stale_timeframes} "
-                    f"trend.30s.closed={number(gate.get('trend_close'))} "
-                    f"entry.{entry_label}.closed={number(gate.get('entry_close'))} "
+                        f"trend.30s.closed={number(trend_close)} "
+                        f"entry.{entry_label}.closed={number(entry_close)} "
+                        f"trend_closed_ts={data.get('trend_closed_ts') or gate.get('trend_closed_ts') or data.get('closed_candles', {}).get('30', {}).get('open_ts')} "
+                        f"entry_closed_ts={data.get('entry_closed_ts') or gate.get('entry_closed_ts') or data.get('closed_candles', {}).get(str(entry_seconds), {}).get('open_ts')} "
                     f"entry_seconds={entry_seconds} "
                     f"entry_age_seconds={seconds(timing.get('age_seconds'))} entry_window={window} "
                     f"{entry_label}.RSI.closed={number(gate.get('rsi'))} "
                     f"{entry_label}.RSI.live={number(live_rsi)} "
                     f"5m={data.get('trend_filter_5m', {}).get('reason', 'unavailable')} "
-                    f"failed_count={len(gate.get('failed_rules', []))} "
+                    f"failed_count={len(failed_rules)} failed_rules={failed_rules_str} "
                     f"accepted={data.get('accepted_orders_this_run', 0)}")
             except (ValueError, TypeError, KeyError):
                 pass
@@ -158,7 +152,7 @@ class MultiAgentTradingSystem:
 
     TICK_INTERVAL     = 1.0
     DECISION_INTERVAL = 1.0
-    CONFIRMATION_WINDOW = 5.0  # Existing allowed delay after the entry candle closes.
+    CONFIRMATION_WINDOW = 15.0  # Part B: 5–15 seconds after the minute opens.
     ASSET_CHECK_EVERY = settings.ASSET_SCAN_INTERVAL
 
     def __init__(self, force_trades: bool = False,
@@ -173,8 +167,10 @@ class MultiAgentTradingSystem:
                  max_runtime: float = 0, chart_view: str = "entry",
                  entry_seconds: Optional[int] = None):
         self.entry_seconds = settings.STRATEGY_ENTRY_SECONDS if entry_seconds is None else entry_seconds
-        if self.entry_seconds not in (30, 60):
-            raise ValueError("Entry candles must be 30 or 60 seconds")
+        if self.entry_seconds != 60:
+            raise ValueError("Part B requires one-minute signal candles")
+        if float(min_confidence) != MIN_CONFIDENCE:
+            raise ValueError("Part B confidence threshold is fixed at 75")
         if settings.RESET_TODAY_LOGS_ON_STARTUP:
             log.warning("[Risk] startup_reset_ignored=true reason=preserve_trade_accounting")
             settings.RESET_TODAY_LOGS_ON_STARTUP = False
@@ -188,10 +184,6 @@ class MultiAgentTradingSystem:
                                           max_daily_loss=daily_loss_limit)
         self.asset_selector = AssetSelectorAgent()
         self.agent1         = MultiTimeframeAgent(settings.ASSET)
-        self.agent2         = RLFeedbackAgent(settings.MODEL_DIR)
-        self.regime         = RegimeDetector()
-        self.chart          = ChartAnalyzer()
-        self.consensus      = MultiTimeframeConsensusAnalyzer(self.chart)
         # Debug / test overrides (set before supervisor creation)
         self.force_trades: bool = bool(force_trades)
         self.training_mode: bool = bool(training_mode)
@@ -204,7 +196,7 @@ class MultiAgentTradingSystem:
         self.daily_loss_limit = self.risk.max_daily_loss
 
         self.supervisor     = PipelineSupervisorAgent(
-            self.bot, self.risk, self.agent1, self.agent2,
+            self.bot, self.risk, self.agent1, None,
             asset_selector=self.asset_selector,
             force_trades=self.force_trades,
             disable_circuit_breaker=self.disable_circuit_breaker,
@@ -278,9 +270,18 @@ class MultiAgentTradingSystem:
         self._bg_tasks: List[asyncio.Task] = []
 
         self._loss_halt_duration_sec = 300.0
+        self._quote_was_stale = True
+        self._last_quote_recovery_ts = 0.0
+        # Feed watchdog state
+        self._feed_watchdog_active = False
+        self._feed_outage_start = None
+        self._feed_outage_cause = None
+        self._feed_recovery_attempts = 0
         snapshot = self._sync_daily_accounting()
         self.supervisor.cb.restore_from_outcomes(snapshot["strategy"]["recent_outcomes"])
         self._log_daily_accounting("restored")
+        # Reset accepted counter for fresh run as requested by user; durable journal remains authoritative.
+        self._accepted_count = 0
 
     def _sync_daily_accounting(self):
         """Daily controls derive from durable records, including pending orders."""
@@ -314,7 +315,7 @@ class MultiAgentTradingSystem:
     def _check_consecutive_loss_halt(self) -> Tuple[bool, str]:
         self._sync_daily_accounting()
         remaining = self._loss_halt_duration_sec - (time.time() - self._loss_halt_time)
-        if self._consecutive_losses >= 4 and remaining > 0:
+        if self._consecutive_losses >= 2 and remaining > 0:
             reason = f"Loss halt active ({self._consecutive_losses} losses), {remaining:.0f}s left"
             log.warning("[DailyRisk] %s", reason)
             return True, reason
@@ -345,27 +346,6 @@ class MultiAgentTradingSystem:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _calculate_consensus_score(self, tf_state: dict,
-                                   direction: str) -> float:
-        if not tf_state:
-            return 0.0
-        sup   = sum(1 for d in tf_state.values()
-                    if isinstance(d, dict) and d.get("vote") == direction)
-        total = sum(1 for d in tf_state.values() if isinstance(d, dict))
-        return sup / total if total > 0 else 0.0
-
-    def _combine_confidences(self, a1: float, rl: float,
-                              experienced: bool, consensus: float,
-                              chart: float) -> float:
-        # Chart is now the PRIMARY signal (EMA+Aroon strategy)
-        # Agent1 MTF is supporting evidence
-        if experienced:
-            fused = 0.40 * a1 + 0.20 * rl + 0.40 * chart
-        else:
-            fused = 0.45 * a1 + 0.55 * chart
-        fused *= (consensus * 0.4 + 0.6)   # softer consensus discount
-        return float(min(0.97, max(0.45, fused)))
-
     async def _get_price(self):
         """Return only a current observation of the selected broker instrument."""
         try:
@@ -391,9 +371,9 @@ class MultiAgentTradingSystem:
             return False
 
     async def setup(self) -> bool:
-        log.info("[Setup] strategy=buy_sell asset=%s monitor=1s active=30s,1m filter=5m expiry=60s_from_entry "
-                 "ema_trend_30s=20,50 entry_seconds=%s ema_entry=9,21 ema_filter_5m=9,21 rsi_buy=50,65 "
-                 "rsi_sell=35,50 swing_left=2 swing_right=2 observe_only=%s",
+        log.info("[Setup] strategy=part_b_vwap_ema8 asset=%s monitor=1s expiry=60s "
+                 "required_candles=5s,10s,15s,20s,30s,1m tick_counts_required=true "
+                 "confidence_min=75 entry_seconds=%s observe_only=%s",
                  self._current_asset, self.entry_seconds, self.observe_only)
         if settings.FTT_DURATION != FTT_DURATION_S:
             log.error("[Setup] status=blocked reason=duration_mismatch configured=%s required=%s", settings.FTT_DURATION, FTT_DURATION_S)
@@ -425,8 +405,17 @@ class MultiAgentTradingSystem:
             self._log_daily_accounting("broker_reconciled")
         display = await configure_strategy_chart(self.bot._page, self._entry_chart_view())
         log.info("[ChartDisplay] %s", json.dumps(display, sort_keys=True))
-        log.info("[StrategyData] source=broker_native_ws trend_seconds=30 entry_seconds=%s "
-                 "display_view=%s trend_structure_required=false", self.entry_seconds, self._entry_chart_view())
+        # Perform startup self-test of writable CSVs to avoid runtime failures.
+        try:
+            ok = self._startup_selftest()
+            if not ok:
+                log.error("[Setup] startup_selftest_failed; aborting startup")
+                return False
+        except Exception as exc:
+            log.error("[Setup] startup_selftest_exception %s", exc)
+            return False
+        log.info("[StrategyData] source=broker_native_ws strategy=part_b entry_seconds=%s "
+                 "display_view=%s missing_required_inputs=fail_closed", self.entry_seconds, self._entry_chart_view())
         native_periods = set()
         # No Yahoo OTC mapping, fabricated 30s bars, or randomized bootstrap.
         for period in (30, 60):
@@ -444,20 +433,15 @@ class MultiAgentTradingSystem:
                 "native_history_available": history is not None and not history.empty,
                 "received_closed_candles": len(history) if history is not None else 0,
                 "retained_closed_candles": len(self.agent1.builders[period]),
-                "minimum_history_closed": 53 if period == 30 else 120,
-                "required_trend_closed": 53 if period == 30 else 0,
-                "required_entry_closed": 21 if period == self.entry_seconds else 0,
+                "minimum_history_closed": 2 if period == 30 else 69,
                 "entry_timeframe_seconds": self.entry_seconds,
-                "filter5m_closed": len(self.agent1.builders[settings.TREND_FILTER_SECONDS]),
-                "filter5m_required_closed": 24,
-                "filter5m_requires_complete_aligned_groups": True,
                 "m1_upsampling": False,
             }, sort_keys=True))
         if native_periods != {30, 60}:
             log.info("[DataConstraint] native_history_missing_for=%s; live browser "
                      "samples are observed quotes, not broker-native tick-complete OHLC; "
-                     "warmup requires 53 closed 30s bars and 24 closed 5m bars "
-                     "aggregated from complete aligned 1m groups; entry_seconds=%s",
+                     "Part B additionally requires 5s/10s/15s/20s history and actual tick counts; "
+                     "missing inputs produce NO TRADE; entry_seconds=%s",
                      sorted({30, 60} - native_periods), self.entry_seconds)
         self._last_evaluation_key = (self.agent1.builders[30].latest_closed_ts,
                                      self.agent1.builders[self.entry_seconds].latest_closed_ts)
@@ -466,40 +450,47 @@ class MultiAgentTradingSystem:
         self._bg_tasks.append(asyncio.create_task(self._native_refresh_loop()))
         self._bg_tasks.append(asyncio.create_task(self._market_refresh_loop()))
         self._bg_tasks.append(asyncio.create_task(self._chart_display_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._feed_watchdog_loop()))
+        return True
+
+    def _startup_selftest(self) -> bool:
+        """Write and read a row from key CSVs to detect permission or path problems.
+
+        Returns True when all checks pass; False otherwise.
+        """
+        from pathlib import Path
+        import csv
+        from utils.safe_io import safe_write_csv_row
+
+        base = Path(__file__).resolve().parent / "data"
+        tests = [
+            (base / "signals_log.csv", ["timestamp", "direction"], {"timestamp": "1970-01-01T00:00:00", "direction": "TEST"}),
+            (base / "feed_outages.csv", ["start", "end"], {"start": "1970-01-01T00:00:00", "end": ""}),
+            (base / "guard_events.csv", ["ts", "event"], {"ts": "1970-01-01T00:00:00", "event": "TEST"}),
+        ]
+        for path, fields, row in tests:
+            try:
+                ok = safe_write_csv_row(path, fields, row, write_header=True)
+                if not ok:
+                    log.error("[StartupSelfTest] write_failed path=%s", path)
+                    return False
+                # verify read
+                with path.open("r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    found = False
+                    for r in reader:
+                        if r.get(list(row.keys())[0]) == list(row.values())[0]:
+                            found = True
+                            break
+                    if not found:
+                        log.error("[StartupSelfTest] read_back_failed path=%s", path)
+                        return False
+            except Exception as exc:
+                log.error("[StartupSelfTest] exception path=%s reason=%s", path, exc)
+                return False
         return True
 
     # ── Background tasks ──────────────────────────────────────────────────────
-
-    async def _periodic_qtable_backup(self, interval_s: int = 3600):
-        while True:
-            try:
-                await asyncio.sleep(interval_s)
-                src = Path(self.agent2.qtable_path)
-                if src.exists():
-                    bdir = Path(settings.MODEL_DIR) / "backups"
-                    bdir.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(
-                        src,
-                        bdir / f"rl_qtable_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                    )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.warning(f"[Backup] {e}")
-
-    async def _daily_replay_and_save(self):
-        await asyncio.sleep(30)
-        while True:
-            try:
-                self.agent2.learn_from_logs(self.risk.journal_path)
-                self.agent2.q.save(self.agent2.qtable_path)
-                log.info("[DailyTrain] RL replayed and Q-table saved")
-                await asyncio.sleep(24 * 3600)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.warning(f"[DailyTrain] {e}")
-                await asyncio.sleep(600)
 
     async def _daily_reset_monitor(self):
         """Reset circuit breaker and daily counters at midnight."""
@@ -615,6 +606,131 @@ class MultiAgentTradingSystem:
                 log.warning("[ChartDisplay] verified=false reason=%s", exc)
             await asyncio.sleep(3)
 
+    async def _write_feed_outage(self, start_ts, end_ts, cause, recovery_step):
+        from pathlib import Path
+        from utils.safe_io import safe_write_csv_row
+        path = Path(__file__).resolve().parent / "data" / "feed_outages.csv"
+        header = ["start", "end", "duration_seconds", "cause", "recovery_step"]
+        row = {"start": datetime.fromtimestamp(start_ts).isoformat(timespec="seconds") if start_ts else "",
+               "end": datetime.fromtimestamp(end_ts).isoformat(timespec="seconds") if end_ts else "",
+               "duration_seconds": (end_ts - start_ts) if start_ts and end_ts else "",
+               "cause": cause, "recovery_step": recovery_step}
+        # Use safe_io helper; do not let logging failures stop recovery.
+        try:
+            safe_write_csv_row(path, header, row, write_header=True)
+        except Exception:
+            # In the unlikely case safe_write_csv_row raises, swallow and log once.
+            try:
+                log.warning("[FeedWatchdog] failed_to_write_outage path=%s", path)
+            except Exception:
+                pass
+
+    async def _feed_watchdog_loop(self):
+        """Monitor quote freshness and run escalating recovery procedures when stale."""
+        while True:
+            try:
+                now = time.time()
+                quote = getattr(self, "_quote", None)
+                quote_age = None
+                if quote and isinstance(quote.get("observed_at"), (int, float)):
+                    quote_age = now - quote.get("observed_at")
+                is_stale = quote is None or not self._quote_is_fresh(quote)
+                # Start outage
+                if is_stale and not getattr(self, '_feed_watchdog_active', False):
+                    self._feed_watchdog_active = True
+                    self._feed_outage_start = now
+                    self._feed_recovery_attempts = 0
+                    # Determine likely cause: trades panel open check
+                    page = getattr(self.bot, '_page', None)
+                    try:
+                        panel_open = await page.locator('[data-test="cor-w-panel-trades"]').is_visible() if page is not None else False
+                    except Exception:
+                        panel_open = False
+                    cause = 'panel_open' if panel_open else 'ws_drop'
+                    self._feed_outage_cause = cause
+                    log.warning("[FeedWatchdog] outage_started cause=%s", cause)
+                # Active recovery attempts
+                if getattr(self, '_feed_watchdog_active', False):
+                    elapsed = now - (getattr(self, '_feed_outage_start', None) or now)
+                    worked = False
+                    step = None
+                    # Step 1: after 10s
+                    if elapsed >= 10 and self._feed_recovery_attempts < 1:
+                        self._feed_recovery_attempts = 1
+                        step = 'close_panels_resubscribe'
+                        # Close panels and verify chart
+                        res = await self.bot._ensure_chart_visible_and_close_panels()
+                        log.info("[FeedWatchdog] step=%s closed=%s result=%s", step, res.get('closed_panels'), res.get('reason'))
+                        # Try re-subscribe
+                        sub = await self.bot.resubscribe_quote_stream()
+                        log.info("[FeedWatchdog] resubscribe=%s", sub)
+                        # Check quote freshness soon after
+                        await asyncio.sleep(1)
+                        if self._quote_is_fresh(getattr(self, '_quote', None)):
+                            worked = True
+                    # Step 2: after 30s
+                    if not worked and elapsed >= 30 and self._feed_recovery_attempts < 2:
+                        self._feed_recovery_attempts = 2
+                        step = 'reload_page'
+                        try:
+                            await self.bot._page.reload()
+                            await asyncio.sleep(2)
+                            # wait for chart to be verified
+                            ok = await reconcile_selected_strategy_chart(self.bot._page, preferred_view=self._entry_chart_view())
+                            log.info("[FeedWatchdog] step=%s result=%s", step, ok.get('reason'))
+                            await asyncio.sleep(1)
+                            if self._quote_is_fresh(getattr(self, '_quote', None)):
+                                worked = True
+                        except Exception as exc:
+                            log.warning("[FeedWatchdog] reload_failed %s", exc)
+                    # Step 3: after 90s
+                    if not worked and elapsed >= 90 and self._feed_recovery_attempts < 3:
+                        self._feed_recovery_attempts = 3
+                        step = 'restart_browser_context'
+                        try:
+                            await self.bot.stop()
+                            await asyncio.sleep(1)
+                            await self.bot.start()
+                            await asyncio.sleep(2)
+                            if self._quote_is_fresh(getattr(self, '_quote', None)):
+                                worked = True
+                        except Exception as exc:
+                            log.warning("[FeedWatchdog] restart_failed %s", exc)
+                    if worked:
+                        # Backfill closed history for 30s and 60s
+                        await self._update_closed_candles(None, native_only=False)
+                        # require one fresh closed candle after reload
+                        await asyncio.sleep(2)
+                        self._feed_watchdog_active = False
+                        end_ts = time.time()
+                        await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, step)
+                        log.info("[FeedWatchdog] recovered step=%s duration=%.1fs", step, end_ts - self._feed_outage_start)
+                    else:
+                        # Escalation failed; if attempts exceeded stop trading
+                        if getattr(self, '_feed_recovery_attempts', 0) >= 3 and elapsed >= 95:
+                            end_ts = time.time()
+                            await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, 'failed')
+                            log.error("[FeedWatchdog] unrecoverable_feed_outage duration=%.1fs cause=%s", end_ts - self._feed_outage_start, self._feed_outage_cause)
+                            # Stop new trading and wait for any active trades to settle
+                            self.running = False
+                            # Wait up to 120s for active trades to be settled via settlement loop
+                            wait_deadline = time.time() + 120
+                            while self.active_trades and time.time() < wait_deadline:
+                                log.info("[FeedWatchdog] waiting_for_settlement active_trades=%s", len(self.active_trades))
+                                await asyncio.sleep(2)
+                            # Proceed to shutdown after waiting
+                            try:
+                                await self._shutdown()
+                            except Exception:
+                                pass
+                            return
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("[FeedWatchdog] error=%s", exc)
+                await asyncio.sleep(1)
+
     async def _market_refresh_loop(self):
         """Request source updates even when the displayed price stays unchanged."""
         previous = None
@@ -623,10 +739,20 @@ class MultiAgentTradingSystem:
             try:
                 refreshed = await self.bot.refresh_native_market_data(self._current_asset)
                 if refreshed != previous:
-                    log.info("[MarketData] %s", json.dumps({
+                    # Log feed drops and recoveries with timestamps and durations.
+                    now_ts = time.time()
+                    log_entry = {
                         "native_forming_fresh_by_timeframe": refreshed,
                         "scope": "native_forming_refresh",
-                        "closed_history_managed_separately": True}, sort_keys=True))
+                        "closed_history_managed_separately": True,
+                        "timestamp": datetime.fromtimestamp(now_ts).isoformat(timespec="seconds"),
+                    }
+                    # Detect which timeframes dropped compared to previous
+                    if previous is not None:
+                        dropped = [p for p, ok in refreshed.items() if not ok and previous.get(p, True)]
+                        recovered = [p for p, ok in refreshed.items() if ok and not previous.get(p, False)]
+                        log_entry.update({"dropped_timeframes": dropped, "recovered_timeframes": recovered})
+                    log.info("[MarketData] %s", json.dumps(log_entry, sort_keys=True))
                     previous = refreshed
             except asyncio.CancelledError:
                 raise
@@ -668,12 +794,6 @@ class MultiAgentTradingSystem:
             self._execution_uncertain = True
             self.running = False
 
-    def _five_minute_filter(self, direction="BUY"):
-        """Use completed 5m EMA direction rather than the legacy reversal vote."""
-        builder = self.agent1.builders.get(settings.TREND_FILTER_SECONDS)
-        return evaluate_five_minute_trend(
-            builder.closed_snapshot() if builder is not None else [], time.time(), direction)
-
     def _monitor_context(self, trend, entry, current_price, direction="BUY"):
         now = time.time()
         quote = getattr(self, "_quote", None)
@@ -707,24 +827,15 @@ class MultiAgentTradingSystem:
                 forming["stale"] = forming.get("stale", False) or not fresh
             forming_bars[period] = forming
             candles[str(period)] = analyze_forming(closed, forming, period, now)
-        clearance = support_clearance = None
-        live_trend = candles["30"]
         live_entry = analyze_forming(entry, forming_bars[self.entry_seconds],
                                      self.entry_seconds, now, role="entry")
-        if (live_trend["support_resistance"] and live_entry["candle"]
-                and not live_entry["candle"]["partial"]):
-            distance = live_trend["support_resistance"]["resistance_distance"]
-            bar = live_entry["candle"]
-            clearance = distance is None or distance > 1.5 * (bar["high"] - bar["low"])
-            support_distance = live_trend["support_resistance"]["support_distance"]
-            support_clearance = support_distance is None or support_distance > bar["high"] - bar["low"]
         history_fresh = all(item["fresh"] for item in closed_status.values())
         entry_close_at = closed_status[str(self.entry_seconds)]["close_at"]
         age = now - entry_close_at if entry_close_at is not None else None
         return {"evaluated_at": now, "asset": self._current_asset,
                 "monitor_interval_seconds": self.DECISION_INTERVAL,
                 "active_candle_seconds": list(settings.ACTIVE_CANDLE_SECONDS),
-                "trend_timeframe_seconds": 30, "entry_timeframe_seconds": self.entry_seconds,
+                "trend_timeframe_seconds": 60, "entry_timeframe_seconds": self.entry_seconds,
                 "trade_expiry_seconds": FTT_DURATION_S, "expiry_basis": "actual_broker_entry",
                 "data_status": "fresh" if fresh and history_fresh else "stale_or_unavailable",
                 "quote_status": "fresh" if fresh else "stale_or_unavailable",
@@ -735,17 +846,15 @@ class MultiAgentTradingSystem:
                 "confirmation_window_seconds": self.CONFIRMATION_WINDOW,
                 "entry_timing": {"timeframe_seconds": self.entry_seconds,
                                  "entry_close_at": entry_close_at, "age_seconds": age,
-                                 "within_window": age is not None and 0 <= age <= self.CONFIRMATION_WINDOW},
+                                 "within_window": age is not None and 5 <= age <= self.CONFIRMATION_WINDOW},
                 "live_price": current_price if fresh else None,
                 "quote_observed_at": observed_at,
                 "quote_age_seconds": quote_age,
                 "quote_freshness": quote.get("freshness") if quote else None,
                 "quote_freshness_source": quote.get("freshness_source") if quote else None,
                 "quote_timestamp_kind": quote.get("timestamp_kind") if quote else None,
-                "provisional_trend_resistance_vs_entry_range": clearance,
-                "provisional_trend_support_vs_entry_range": support_clearance,
                 "entry_candle": live_entry,
-                "candles": candles, "trend_filter_5m": self._five_minute_filter(direction)}
+                "candles": candles}
 
     def _publish_decision(self, context, decision, reason):
         if reason in {"stale_or_unavailable_quote", "stale_candle_snapshot", "quote_expired_during_preflight"}:
@@ -754,8 +863,6 @@ class MultiAgentTradingSystem:
             stage = "timing"
         elif reason in {"risk_limit_or_loss_halt", "capacity", "payout_unavailable_or_below_minimum"}:
             stage = "risk"
-        elif reason.startswith("5m_") or reason in {"stale_5m_candles", "invalid_5m_candles"}:
-            stage = "trend_filter"
         elif reason in {"order_unresolved", "chart_update_in_progress", "checking_demo_order_conditions",
                         "execution_rejected", "execution_uncertain", "order_accepted", "setup_already_attempted"}:
             stage = "execution"
@@ -769,78 +876,90 @@ class MultiAgentTradingSystem:
         log.info("[Decision] %s", json.dumps(payload, sort_keys=True, allow_nan=False))
         return payload
 
+    def _evaluate_part_b(self, current_price):
+        """Evaluate supplied history without altering or synthesizing market data."""
+        histories = {period: builder.closed_snapshot()
+                     for period, builder in self.agent1.builders.items()}
+        evaluation = evaluate_strategy(
+            histories, timestamp=time.time(), current_price=current_price,
+            asset=self._current_asset)
+        # All evaluations, including missing histories, reach the existing logger.
+        log.info("%s", evaluation["report"])
+        # Log evaluation as a durable CSV row using safe_write_csv_row; don't block trading on I/O failures.
+        try:
+            from pathlib import Path
+            path = Path(__file__).resolve().parent / "data" / "signals_log.csv"
+            fields = ["timestamp", "direction", "taken", "skip_reason", "entry_price",
+                      "outcome", "confidence", "first_failed_gate", "vwap", "ema8", "stake", "payout_pct", "baseline", "pnl"]
+            row = {
+                "timestamp": datetime.fromtimestamp(time.time()).isoformat(timespec="seconds"),
+                "direction": evaluation["signal"], "taken": False,
+                "skip_reason": evaluation["reason"] if evaluation["signal"] == "NO TRADE" else "",
+                "entry_price": current_price, "outcome": "not_taken",
+                "confidence": evaluation["confidence"],
+                "first_failed_gate": evaluation["first_failed_gate"],
+                "vwap": evaluation["fields"].get("VWAP"),
+                "ema8": evaluation["fields"].get("8 EMA"),
+                "stake": float(self.trade_amount), "payout_pct": self.payout_minimum,
+                "baseline": False, "pnl": 0.0,
+            }
+            safe_write_csv_row(path, fields, row, write_header=True)
+        except Exception:
+            pass
+        return histories, evaluation
+
     async def _evaluate_and_trade(self, current_price: Optional[float]):
-        trend = self.agent1.builders[30].closed_snapshot()
-        entry = trend if self.entry_seconds == 30 else self.agent1.builders[60].closed_snapshot()
+        histories, evaluation = self._evaluate_part_b(current_price)
+        trend, entry = histories.get(30, []), histories.get(60, [])
         key = (trend[-1]["ts"] if trend else None,
                entry[-1]["ts"] if entry else None)
-        changed = key != self._last_evaluation_key and key != (None, None)
         self._last_evaluation_key = key
-        evaluator = select_entry_evaluator()
-        param_count = len(inspect.signature(evaluator).parameters)
-        if param_count >= 4:
-            results = evaluator(trend, entry, self.entry_seconds,
-                               getattr(settings, "DEMO_EMA_TOUCH_TOLERANCE_MULTIPLIER", 0.15))
-        else:
-            results = evaluator(trend, entry, self.entry_seconds)
-        if getattr(settings, "DEMO_STRATEGY_ENABLED", False):
-            legacy = evaluate_both(trend, entry, self.entry_seconds)
-            for side in ("BUY", "SELL"):
-                results[side]["legacy_gate_diagnostics"] = legacy[side]
-        confirmed = [side for side in ("BUY", "SELL") if results[side]["passed"]]
-        direction = confirmed[0] if len(confirmed) == 1 else None
-        # A trend-side diagnostic explains WAIT without authorizing an entry.
-        ema20, ema50 = results["BUY"].get("ema20"), results["BUY"].get("ema50")
-        diagnostic_direction = direction or (
-            "SELL" if ema20 is not None and ema50 is not None and ema20 < ema50 else "BUY")
-        gate = results[diagnostic_direction]
+        direction = {"CALL": "BUY", "PUT": "SELL"}.get(evaluation["signal"])
 
         def decision_context(price):
-            context = self._monitor_context(trend, entry, price, diagnostic_direction)
-            context.update(buy_evaluation=results["BUY"], sell_evaluation=results["SELL"],
-                           entry_evaluation=gate, direction=direction,
-                           diagnostic_direction=diagnostic_direction)
+            context = self._monitor_context(trend, entry, price, direction)
+            gate = dict(evaluation, passed=evaluation["signal"] != "NO TRADE",
+                        failed_rules=[evaluation["reason"]] if evaluation["signal"] == "NO TRADE" else [])
+            context.update(strategy_evaluation=evaluation, entry_evaluation=gate,
+                           signal=evaluation["signal"], confidence=evaluation["confidence"],
+                           first_failed_gate=evaluation["first_failed_gate"],
+                           direction=direction, diagnostic_direction=direction,
+                           trend_close=trend[-1]["close"] if trend else None,
+                           entry_close=entry[-1]["close"] if entry else None)
             return context
 
+        quote_fresh = bool(current_price is not None and self._quote_is_fresh(getattr(self, "_quote", None)))
+        if quote_fresh and getattr(self, "_quote_was_stale", False):
+            self._last_quote_recovery_ts = time.time()
+        self._quote_was_stale = not quote_fresh
         context = decision_context(current_price)
-        for gate_direction, evaluated_gate in (results.items() if changed else []):
-            payload = dict(evaluated_gate, asset=self._current_asset,
-                           trend_closed_ts=key[0], entry_closed_ts=key[1],
-                           source=self._seed_sources.get(30, "broker_browser_sample"),
-                           entry_source=self._seed_sources.get(self.entry_seconds, "broker_browser_sample"),
-                           closed_only=True, candle_event=self.closed_events,
-                           execution_enabled=True,
-                           trend_structure_required=False,
-                           live_price=current_price)
-            log.info("[%sOnlyGate] %s", gate_direction.title(),
-                     json.dumps(payload, sort_keys=True, allow_nan=False))
+        if direction is None:
+            return self._publish_decision(context, "NO TRADE", evaluation["reason"])
         # Logging a snapshot does not consume an entry. Revisit delayed history
         # within the confirmation window; only an attempted setup is consumed.
         if context["quote_status"] != "fresh":
             return self._publish_decision(context, "NO TRADE", "stale_or_unavailable_quote")
+        if getattr(self, '_feed_watchdog_active', False):
+            return self._publish_decision(context, "NO TRADE", "feed_recovery_in_progress")
+        if time.time() - getattr(self, '_last_quote_recovery_ts', 0.0) < 2.0:
+            return self._publish_decision(context, "NO TRADE", "feed_recovery_cooldown")
         if context["closed_candle_status"] != "fresh":
             return self._publish_decision(context, "NO TRADE", "stale_candle_snapshot")
         chart_busy = getattr(self, "_chart_sync_active", False)
         if (self.active_trades or self._execution_uncertain
                 or (self._execution_lock.locked() and not chart_busy)):
-            return self._publish_decision(context, "WAIT", "order_unresolved")
-        if len(confirmed) > 1:
-            return self._publish_decision(context, "NO TRADE", "conflicting_directional_setups")
-        if direction is None or not entry:
-            return self._publish_decision(context, "WAIT", gate.get("reason", "awaiting_closed_confirmation"))
+            return self._publish_decision(context, "NO TRADE", "order_unresolved")
         now = time.time()
         if any(not candles or candles[-1]["ts"] != math.floor(now / period) * period - period
                for candles, period in ((trend, 30), (entry, self.entry_seconds))):
             return self._publish_decision(context, "NO TRADE", "stale_candle_snapshot")
-        if not context["trend_filter_5m"]["passed"]:
-            return self._publish_decision(context, "NO TRADE", context["trend_filter_5m"]["reason"])
         if self._setup_already_attempted(key[1]):
-            return self._publish_decision(context, "WAIT", "setup_already_attempted")
-        if not 0 <= time.time() - (key[1] + self.entry_seconds) <= self.CONFIRMATION_WINDOW:
+            return self._publish_decision(context, "NO TRADE", "setup_already_attempted")
+        if not 5 <= time.time() - (key[1] + self.entry_seconds) <= self.CONFIRMATION_WINDOW:
             log.info("[Execution] status=blocked reason=stale_confirmation entry_ts=%s", key[1])
-            return self._publish_decision(context, "WAIT", "awaiting_next_closed_confirmation")
+            return self._publish_decision(context, "NO TRADE", "awaiting_next_closed_confirmation")
         if chart_busy:
-            return self._publish_decision(context, "WAIT", "chart_update_in_progress")
+            return self._publish_decision(context, "NO TRADE", "chart_update_in_progress")
         if self.observe_only:
             log.info("[Execution] status=observe_only direction=%s entry_ts=%s", direction, key[1])
             return self._publish_decision(context, direction, f"confirmed_{direction.lower()}_observe_only")
@@ -848,10 +967,10 @@ class MultiAgentTradingSystem:
             raise RuntimeError("Execution requires the shared process lock")
         async with self._execution_lock:
             if self._setup_already_attempted(key[1]):
-                return self._publish_decision(context, "WAIT", "setup_already_attempted")
+                return self._publish_decision(context, "NO TRADE", "setup_already_attempted")
             if self.active_trades or self._execution_uncertain:
                 log.info("[Execution] status=blocked reason=order_unresolved")
-                return self._publish_decision(context, "WAIT", "order_unresolved")
+                return self._publish_decision(context, "NO TRADE", "order_unresolved")
             now = time.time()
             if any(candles[-1]["ts"] != math.floor(now / period) * period - period
                    for candles, period in ((trend, 30), (entry, self.entry_seconds))):
@@ -863,27 +982,31 @@ class MultiAgentTradingSystem:
             if remaining <= 0 or budget <= 0:
                 log.info("[Execution] status=blocked reason=capacity")
                 return self._publish_decision(context, "NO TRADE", "capacity")
-            self._publish_decision(context, "WAIT", "checking_demo_order_conditions")
+            self._publish_decision(context, "NO TRADE", "checking_demo_order_conditions")
             payout = await self.bot.get_asset_payout(self._current_asset)
             context = decision_context((self._quote or {}).get("price"))
             if payout is None or not self.payout_minimum <= payout <= 1.0:
                 log.info("[Execution] status=blocked reason=payout payout=%s minimum=%s", payout, self.payout_minimum)
                 return self._publish_decision(context, "NO TRADE", "payout_unavailable_or_below_minimum")
-            if not 0 <= time.time() - (key[1] + self.entry_seconds) <= self.CONFIRMATION_WINDOW:
+            if not 5 <= time.time() - (key[1] + self.entry_seconds) <= self.CONFIRMATION_WINDOW:
                 log.info("[Execution] status=blocked reason=stale_confirmation entry_ts=%s", key[1])
-                return self._publish_decision(context, "WAIT", "awaiting_next_closed_confirmation")
+                return self._publish_decision(context, "NO TRADE", "awaiting_next_closed_confirmation")
             if not self._quote_is_fresh(getattr(self, "_quote", None)):
                 return self._publish_decision(context, "NO TRADE", "quote_expired_during_preflight")
             if context["closed_candle_status"] != "fresh":
                 return self._publish_decision(context, "NO TRADE", "stale_candle_snapshot")
-            if not context["trend_filter_5m"]["passed"]:
-                return self._publish_decision(context, "NO TRADE", context["trend_filter_5m"]["reason"])
+            _, latest = self._evaluate_part_b((self._quote or {}).get("price"))
+            if latest["signal"] != evaluation["signal"]:
+                evaluation = latest
+                context = decision_context((self._quote or {}).get("price"))
+                return self._publish_decision(context, "NO TRADE", latest["reason"])
+            evaluation = latest
             self._last_attempted_entry = key[1]
             self._last_attempted_entry_seconds = self.entry_seconds
             self._persist_attempted_entry(key[1])
             signal = Signal.BUY if direction == "BUY" else Signal.SELL
-            self._publish_decision(context, direction, f"closed_{direction.lower()}_and_5m_filter_confirmed")
-            # Preserve the existing gate score; this is not a calibrated win probability.
+            self._publish_decision(context, direction, evaluation["reason"])
+            # Part B confidence is a rule score, not a calibrated win probability.
             self._persist_order_state({"status": "submitting", "asset": self._current_asset,
                                        "direction": direction, "entry_ts": key[1],
                                        "entry_timeframe_seconds": self.entry_seconds,
@@ -891,8 +1014,24 @@ class MultiAgentTradingSystem:
                                        "submitted_at": datetime.now().isoformat(timespec="microseconds")})
             submission_evaluated_at = context["evaluated_at"]
             try:
+                # Chart guard: ensure no panels are open before attempting a click.
+                try:
+                    guard = await self.bot._ensure_chart_visible_and_close_panels()
+                    log.info("[ChartGuard] preflight_closed=%s reason=%s", guard.get('closed_panels'), guard.get('reason'))
+                    if not guard.get('verified'):
+                        context = decision_context((self._quote or {}).get("price"))
+                        return self._publish_decision(context, "NO TRADE", "chart_not_ready")
+                except Exception as _:
+                    log.warning("[ChartGuard] preflight_failed")
+                _, latest = self._evaluate_part_b((self._quote or {}).get("price"))
+                if latest["signal"] != evaluation["signal"]:
+                    evaluation = latest
+                    context = decision_context((self._quote or {}).get("price"))
+                    self._persist_order_state(None)
+                    return self._publish_decision(context, "NO TRADE", latest["reason"])
+                evaluation = latest
                 success = await self.supervisor.safe_execute_trade(
-                    signal, 0.95, "ftt",
+                    signal, evaluation["confidence"] / 100.0, "ftt",
                     entry_deadline=key[1] + self.entry_seconds + self.CONFIRMATION_WINDOW)
             except asyncio.CancelledError:
                 # Keep the durable submitting record and block later setups even
@@ -921,15 +1060,21 @@ class MultiAgentTradingSystem:
             order = dict(self.bot.last_order or {})
             timestamp = datetime.now().isoformat(timespec="microseconds")
             order.update(timestamp=timestamp, signal=direction, asset=self._current_asset,
-                         state_key="CLOSED_CANDLE_GATE", entry_ts=key[1],
+                         state_key="PART_B_VWAP_EMA8", entry_ts=key[1],
                          entry_timeframe_seconds=self.entry_seconds)
             self._persist_order_state({"status": "accepted", "order": order})
             self.risk.record_trade(TradeRecord(
                 timestamp=timestamp, asset=self._current_asset, mode="ftt",
-                signal=direction, confidence=0.95, amount=order.get("amount", self.trade_amount),
+                signal=direction, confidence=evaluation["confidence"] / 100.0, amount=order.get("amount", self.trade_amount),
                 state_key=order["state_key"]))
             self.active_trades.append(order)
             self._accepted_count += 1
+            # Chart guard: ensure panels closed after acceptance and log
+            try:
+                post = await self.bot._ensure_chart_visible_and_close_panels()
+                log.info("[ChartGuard] post_accept_closed=%s reason=%s", post.get('closed_panels'), post.get('reason'))
+            except Exception:
+                log.warning("[ChartGuard] post_accept_failed")
             log.info("[Execution] %s", json.dumps(dict(order, status="accepted", direction=direction), default=str))
             # Do not manufacture outcomes from a later quote. Until the platform
             # settlement adapter confirms this order, further entries stay blocked.
@@ -1028,45 +1173,28 @@ class MultiAgentTradingSystem:
 
 if __name__ == "__main__":
     configure_logging()
-    parser = argparse.ArgumentParser(description="BUY/SELL demo bot with one-second monitoring and confirmed entries")
+    parser = argparse.ArgumentParser(description="Part B VWAP/EMA8 one-minute strategy with one-second monitoring")
     parser.add_argument("--chart-view", choices=("entry", "trend", "filter5m"), default="entry",
                         help="Initial chart: selected entry period EMA9/21, 30s trend EMA20/50, or 5m EMA9/21")
-    parser.add_argument("--entry-seconds", type=int, choices=(30, 60), default=settings.STRATEGY_ENTRY_SECONDS,
-                        help="Completed entry candle period (default: 30; 60 keeps legacy minute entries)")
+    parser.add_argument("--entry-seconds", type=int, choices=(60,), default=settings.STRATEGY_ENTRY_SECONDS,
+                        help="Part B uses completed one-minute signal candles")
     parser.add_argument("--observe-only", action="store_true", help="Collect actual quotes and evaluate without clicks")
     parser.add_argument("--max-candle-closes", type=int, default=0, help="Stop after this many real close events; 0 runs continuously")
     parser.add_argument("--max-runtime", type=float, default=0, help="Bound runtime after login in seconds")
-    parser.add_argument('--force-trades', action='store_true',
-                        help='Force trades by bypassing the confluence gate (testing only)')
-    parser.add_argument('--training-mode', action='store_true',
-                        help='Enable training mode so the risk engine uses training overrides')
-    parser.add_argument('--disable-circuit-breaker', action='store_true',
-                        help='Ignore local circuit-breaker limits for testing')
-    parser.add_argument('--min-confidence', type=float, default=MIN_CONFIDENCE,
-                        help='Minimum final confidence required to execute a trade')
     parser.add_argument('--trade-amount', type=float, default=TRADE_AMOUNT,
                         help='Trade amount to use for this run')
     parser.add_argument('--max-daily-trades', type=int, default=None,
                         help='Override maximum daily trades')
     parser.add_argument('--max-daily-loss', type=float, default=None,
                         help='Override the daily loss limit for the local circuit breaker')
-    parser.add_argument('--confidence-threshold', type=float, default=None,
-                        help='Override the risk confidence threshold for the risk manager')
     parser.add_argument('--payout-minimum', type=float, default=PAYOUT_MINIMUM,
                         help='Minimum payout percentage required to place a trade')
 
     args = parser.parse_args()
-    if args.force_trades:
-        args.training_mode = True
-        args.disable_circuit_breaker = True
-    if args.training_mode:
-        settings.TRAINING_MODE = True
     if args.max_daily_trades is not None:
         settings.MAX_DAILY_TRADES = args.max_daily_trades
     if args.max_daily_loss is not None:
         settings.MAX_DAILY_LOSS_USD = args.max_daily_loss
-    if args.confidence_threshold is not None:
-        settings.CONFIDENCE_THRESHOLD = args.confidence_threshold
     if args.trade_amount is not None:
         settings.TRADE_AMOUNT = args.trade_amount
 
@@ -1079,10 +1207,6 @@ if __name__ == "__main__":
                     entry_seconds=args.entry_seconds,
                     max_candle_closes=args.max_candle_closes,
                     max_runtime=args.max_runtime,
-                    force_trades=args.force_trades,
-                    training_mode=args.training_mode,
-                    disable_circuit_breaker=args.disable_circuit_breaker,
-                    min_confidence=args.min_confidence,
                     trade_amount=args.trade_amount,
                     payout_minimum=args.payout_minimum,
                     max_trades_per_day=(args.max_daily_trades
