@@ -29256,3 +29256,83 @@ timestamp,direction,taken,skip_reason,entry_price,expiry_price,outcome,ema9,ema2
 2026-10-08T02:34:22,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09689,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
 2026-10-08T02:34:23,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
 2026-10-08T02:34:24,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:36,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:37,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09688,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:38,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:39,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:40,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.0969,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:41,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09692,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:42,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09691,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:43,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09691,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:01,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:02,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:04,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:05,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T00:00:00,TEST
+1970-01-01T08:30:01,CALL,False,,2.1726,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:02,CALL,False,,2.1727,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:03,CALL,False,,2.1728,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:04,CALL,False,,2.1729000000000003,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:05,CALL,False,,2.173,not_taken,95,,,,200.0,0.8,False,0.0
+2026-10-08T02:34:44,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09693,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:45,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:46,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09686,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:47,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.0969,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:48,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.0969,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:49,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09688,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:50,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09685,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:51,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:52,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09686,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:53,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09689,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:54,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09689,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:55,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09688,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:56,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09691,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:57,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09692,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:58,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09686,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:34:59,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09686,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:00,NO TRADE,False,Gate 1 failed: stale 60s closed candles,1.09689,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:01,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09688,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:02,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09686,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:03,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:04,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09687,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:05,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09683,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:06,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:07,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:08,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:09,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09683,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:10,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09677,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:11,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09677,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:12,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09679,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:13,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09676,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:14,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:15,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09682,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:16,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09681,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:17,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09681,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:18,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09688,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:19,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09691,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:20,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09691,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:21,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09694,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:22,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09694,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:23,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09699,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:24,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09699,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+2026-10-08T02:35:25,NO TRADE,False,Gate 1 failed: VWAP requires genuine tick counts on all 60 minute candles,1.09703,not_taken,0,1,unavailable,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:01,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:02,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:04,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:05,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T00:00:00,TEST
+1970-01-01T08:30:01,CALL,False,,2.1726,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:02,CALL,False,,2.1727,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:03,CALL,False,,2.1728,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:04,CALL,False,,2.1729000000000003,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:05,CALL,False,,2.173,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:01,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:02,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:04,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T08:30:05,NO TRADE,False,Gate 1 failed: VWAP distance or slope does not confirm bias,1.105,not_taken,0,1,1.1166666666666667,unavailable,200.0,0.8,False,0.0
+1970-01-01T00:00:00,TEST
+1970-01-01T08:30:01,CALL,False,,2.1726,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:02,CALL,False,,2.1727,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:03,CALL,False,,2.1728,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:04,CALL,False,,2.1729000000000003,not_taken,95,,,,200.0,0.8,False,0.0
+1970-01-01T08:30:05,CALL,False,,2.173,not_taken,95,,,,200.0,0.8,False,0.0

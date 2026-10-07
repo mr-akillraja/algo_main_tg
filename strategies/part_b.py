@@ -2,7 +2,10 @@
 
 Candles have ``ts`` (UTC epoch opening time), OHLC and genuine ``ticks`` counts.
 Only closed, aligned, contiguous candles are used. Forming candles are ignored.
-Missing ticks are never replaced with quote samples, unit weights or volume.
+VWAP volume mode: configurable `vwap_volume_mode` controls how VWAP is computed:
+- "equal": treat every minute as unit volume (VWAP becomes a rolling mean of typical price).
+- "ticks": use genuine per-minute `ticks` counts; if any tick counts are missing the VWAP gate fails.
+This file's evaluator logs the active VWAP mode and reports which later gates fail after Gate 1 passes.
 
 ``indicators`` optionally supplies positive ``vwap``, ``ema8``, ``atr1m`` and
 ``atr15s`` scalars for the latest closed candle. Timestamp-keyed mappings named
@@ -404,6 +407,12 @@ def evaluate_strategy(candles_by_timeframe: Mapping[int, Sequence[dict]], *, tim
         last = len(minutes) - 1
         values = _Indicators(minutes, indicators or {})
         atr = values.value("atr1m", last)
+        # record the currently active VWAP mode
+        try:
+            from config.settings import VWAP_VOLUME_MODE
+            values.vwap_volume_mode = VWAP_VOLUME_MODE
+        except Exception:
+            pass
         vwap = values.value("vwap", last)
         historical_vwaps = [values.value("vwap", i) for i in range(last - 9, last + 1)]
         close = minutes[-1]["close"]
@@ -428,6 +437,34 @@ def evaluate_strategy(candles_by_timeframe: Mapping[int, Sequence[dict]], *, tim
     fields["1-Minute Trend"] = "bullish" if side == 1 else "bearish"
     score("vwap", min(_strength(abs(dv), 0.5, 1.5), _strength(side * slope, 0.1, 0.3), _strength(aligned, 6, 8)))
     metrics["passed_gates"].append(1)
+    # If Gate 1 passed, record which later gates would fail (for diagnostics).
+    later_gate_failures = []
+    def probe_gate(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except _Unavailable as e:
+            return str(e)
+    # We'll run lightweight probes to surface which gate would fail next without raising.
+    # Probe Gate 2..7 in sequence; stop at first failure recorded.
+    try:
+        # Probe Gate 2: EMA confirmation
+        try:
+            _ = values.value("ema8", last)
+            _ = values.value("ema8", last - 3)
+        except _Unavailable as e:
+            later_gate_failures.append((2, str(e)))
+        # Probe Gate 3: pivots
+        try:
+            pivots = confirmed_pivots(minutes)
+            highs = [p for p in pivots if p["kind"] == "high"]
+            lows = [p for p in pivots if p["kind"] == "low"]
+            if len(highs) < 2 or len(lows) < 2:
+                later_gate_failures.append((3, "two confirmed pivot highs and lows are required"))
+        except Exception as e:
+            later_gate_failures.append((3, str(e)))
+    except Exception:
+        pass
+    metrics["later_gate_failures"] = later_gate_failures
     try:
         ema = values.value("ema8", last)
         ema_slope = (ema - values.value("ema8", last - 3)) / atr

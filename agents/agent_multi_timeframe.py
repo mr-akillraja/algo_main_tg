@@ -290,9 +290,10 @@ class MultiTimeframeAgent:
 
     def log_seed_sources(self):
         for period, builder in self.builders.items():
+            native = builder.source != "broker_browser_sample"
             log.info("[Agent1Seed] timeframe=%ss source=%s closed_count=%s native_history=%s",
                      period, builder.source, len(builder),
-                     "unavailable" if builder.source == "broker_browser_sample" else "provided")
+                     "provided" if native else "unavailable")
 
     def seed_from_dataframe(self, df, timeframe: int = TF_1M,
                             source: str = "unspecified", now: Optional[float] = None, log_seed: bool = True):

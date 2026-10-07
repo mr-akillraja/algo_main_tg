@@ -579,14 +579,17 @@ class MultiAgentTradingSystem:
     def _update_forming_candles(self, price):
         """Observe both active bars without promoting native samples to history."""
         observed = self._quote.get("read_at", self._quote["observed_at"])
-        for period in settings.ACTIVE_CANDLE_SECONDS:
+        observed = self._quote.get("read_at", self._quote["observed_at"])
+        # Update forming candles for every builder we maintain (including sub-minute ones)
+        for period in sorted(self.agent1.builders.keys()):
             builder = self.agent1.builders[period]
             if self._seed_sources.get(period) == "broker_native_ws":
                 native = self.bot.get_native_forming_candle(self._current_asset, period)
                 builder.update_forming(price, observed, native=native)
-            elif builder.add_tick(price, observed) and period == 60:
-                self.agent1.aggregate_five_minute()
-
+            else:
+                closed = builder.add_tick(price, observed)
+                if closed and period == 60:
+                    self.agent1.aggregate_five_minute()
     async def _native_refresh_loop(self):
         """Slow broker history responses cannot suspend the one-second monitor."""
         while True:
