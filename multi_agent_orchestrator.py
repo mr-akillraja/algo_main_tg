@@ -14,6 +14,28 @@ import math
 from contextlib import nullcontext
 from bot.process_lock import ProcessLock
 from utils.safe_io import safe_write_csv_row
+
+
+def append_signal_log_row(row: dict):
+    """Compatibility shim: write a signal row to data/signals_log.csv.
+
+    Tests and older modules may monkeypatch `append_signal_log_row` on this
+    module; keep the function present and delegate to `safe_write_csv_row`.
+    """
+    try:
+        from pathlib import Path
+        path = Path(__file__).resolve().parent / "data" / "signals_log.csv"
+        desired = [
+            "timestamp", "direction", "taken", "skip_reason", "entry_price",
+            "outcome", "confidence", "first_failed_gate", "vwap", "ema8",
+            "stake", "payout_pct", "baseline", "pnl",
+        ]
+        extra = [k for k in row.keys() if k not in desired]
+        fieldnames = desired + extra
+        safe_write_csv_row(path, fieldnames, row, write_header=True)
+    except Exception:
+        # Never raise: logging must not stop strategy execution.
+        return
 from strategies.part_b import evaluate_strategy
 from strategies.live_monitor import analyze_forming
 
@@ -134,6 +156,11 @@ def configure_logging():
                   logging.FileHandler(log_file, encoding="utf-8"),
                   logging.FileHandler(run_log, encoding="utf-8")])
     log.info("[RunLog] path=%s", run_log.resolve())
+    try:
+        from config.settings import VWAP_VOLUME_MODE
+        log.info("[Config] VWAP_VOLUME_MODE=%s", VWAP_VOLUME_MODE)
+    except Exception:
+        pass
 
 
 # ── OHLC helper (fixes RSI=2.9 seed noise bug) ───────────────────────────────
@@ -909,6 +936,24 @@ class MultiAgentTradingSystem:
         return histories, evaluation
 
     async def _evaluate_and_trade(self, current_price: Optional[float]):
+        # Read closed-candle histories first. If the current quote is stale or
+        # unavailable we must publish NO TRADE without running the heavy
+        # evaluator so recovery preserves native history as tests expect.
+        histories = {period: builder.closed_snapshot()
+                     for period, builder in self.agent1.builders.items()}
+        trend, entry = histories.get(30, []), histories.get(60, [])
+        key = (trend[-1]["ts"] if trend else None,
+               entry[-1]["ts"] if entry else None)
+        self._last_evaluation_key = key
+
+        quote_fresh = bool(current_price is not None and self._quote_is_fresh(getattr(self, "_quote", None)))
+        if quote_fresh and getattr(self, "_quote_was_stale", False):
+            self._last_quote_recovery_ts = time.time()
+        self._quote_was_stale = not quote_fresh
+        if not quote_fresh:
+            context = self._monitor_context(trend, entry, current_price)
+            return self._publish_decision(context, "NO TRADE", "stale_or_unavailable_quote")
+
         histories, evaluation = self._evaluate_part_b(current_price)
         trend, entry = histories.get(30, []), histories.get(60, [])
         key = (trend[-1]["ts"] if trend else None,

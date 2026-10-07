@@ -1,363 +1,167 @@
-# TRADING STRATEGY GUIDE — $10,000 Account with $2,000 Daily Loss Management
+# Part B: VWAP and EMA8 strategy
 
-## EXECUTIVE SUMMARY
+Part B is the sole source of directional trade decisions. It evaluates closed
+5s, 10s, 15s, 20s, 30s and 1m candles in Python, returns `CALL`, `PUT` or
+`NO TRADE`, and uses a fixed confidence threshold of 75 for a one-minute expiry.
+No LLM, trained model, reinforcement learning or alternative entry gate is used.
 
-**Account Setup:**
-- Starting Capital: $10,000
-- Daily Loss Limit: $2,000 (20% of account)
-- Risk Per Trade: $200 (2% of account)
-- Max Trades Per Day: 20 trades
-- Max Consecutive Losses Before Limit: 10 losses = $2,000
+## Current live-data limitation
 
-**Key Rule:** Once daily loss hits $2,000, trading stops for the day (circuit breaker).
+The existing protected data path builds only 30s, 60s and 300s OHLC candles and
+does not retain real tick counts. It cannot supply Part B's complete inputs.
+The strategy returns `NO TRADE` when required inputs are missing. It does not
+manufacture smaller candles, treat price polling as tick volume, or substitute
+equal weights for tick-weighted VWAP. Authoritative 5s, 10s, 15s and 20s candles
+and either actual tick counts or the required precomputed indicator values are
+needed before live Part B entries are possible. Browser automation, live price
+ingestion and candle-building behavior remain protected.
 
----
+The browser retains its existing `Signal.BUY`, `Signal.SELL`, `Signal.HOLD`
+interface. A strategy-side adapter maps Part B's three outputs to that enum.
+Account risk limits, settlement, order deduplication, data validity and browser
+execution safeguards remain operational controls; they do not create signals.
 
-## STRATEGIC FRAMEWORK (Whiteboard Plan)
+## Indicator definitions
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    4-AGENT TRADING PLAN                    │
-└─────────────────────────────────────────────────────────────┘
+Only closed candles contribute to indicators and structure. The forming minute
+supplies entry time and current price. Supplied authoritative indicators take
+precedence over local calculations; historical indicator values are required
+where slopes or historical VWAP comparisons depend on them.
 
-         A1: ASSET SELECTION          
-         4x Per Day Opening
-         ↓
-         9:00 AM    → EUR/USD
-         11:30 AM   → GBP/USD  
-         2:00 PM    → USD/JPY
-         4:00 PM    → (Rotate)
-         ↓
-         
-    ┌────────────────────────────────────────┐
-    │  A2: STRATEGY PLANNING    A5: EXECUTION│
-    │  • Trend Analysis                       │
-    │  • Volatility Check                     │
-    │  • Confidence Scoring                   │
-    │  • Entry/Exit Rules                     │
-    │  • Risk Sizing                          │
-    │  • Position Management                  │
-    └────────────────────────────────────────┘
-         ↓
-    A3: TIME EXECUTION
-    • 5-minute hold time
-    • Entry at signal
-    • Exit on TP/SL
-    • Track execution
-         ↓
-    A4: REINFORCEMENT LEARNING
-    • Trade outcome evaluation
-    • Win/Loss feedback
-    • Model improvement
-    • Daily limit enforcement
-         ↓
-    NEXT CYCLE (Every 5-60 seconds)
-```
+All price distances below are divided by `ATR1m`, except the explicitly named
+`ATR15s` burst threshold.
 
----
+| Value | Definition |
+| --- | --- |
+| ATR1m | Wilder ATR(14) of 1m candles |
+| ATR15s | ATR(14) of 15s candles |
+| Typical price | `(high + low + close) / 3` |
+| VWAP | `sum(typical_price * ticks) / sum(ticks)` over the last 60 1m candles |
+| EMA8 | EMA of 1m closes, period 8 |
+| dV | `(last_close1m - VWAP) / ATR1m` |
+| VWAPslope | `(VWAP - VWAP_5_bars_ago) / ATR1m` |
+| EMAslope | `(EMA8 - EMA8_3_bars_ago) / ATR1m` |
+| CLV | `((close - low) - (high - close)) / (high - low)` |
 
-## DETAILED AGENT DESCRIPTIONS
+Zero-range candles cannot establish a directional CLV, rejection or breakout.
+Missing, invalid or insufficient inputs produce `NO TRADE` rather than a guess.
 
-### **A1: ASSET SELECTION (4x Daily)**
+## Ordered hard gates
 
-**Schedule:**
-```
-9:00 AM    → Morning Session   (EUR/USD)
-11:30 AM   → Mid-Morning       (GBP/USD)
-2:00 PM    → Afternoon         (USD/JPY)
-4:00 PM    → Late Afternoon    (Rotate)
-```
+Evaluation stops at the first failed gate. Every evaluation, including a
+`NO TRADE` result, is logged with that gate and its reason.
 
-**What happens:**
-- Charts automatically open
-- Asset selected based on rotation
-- 30-min analysis window per session
-- New trading pairs prevent over-focusing on one asset
+1. **VWAP bias.** Bullish requires `dV >= 0.5` and `VWAPslope >= 0.10`;
+   bearish requires `dV <= -0.5` and `VWAPslope <= -0.10`. At least six of the
+   last eight 1m closes must be on the bias side of VWAP. A pullback does not
+   cancel bias when its close remains on that side. Three or more VWAP side
+   changes among the last ten closes veto entry.
+2. **EMA8.** Bullish requires close at or above EMA8 and slope at least `0.10`;
+   bearish requires close at or below EMA8 and slope at most `-0.10`. A flat
+   slope fails. Price on the opposing EMA8 side more than `0.30` away is a
+   conflict.
+3. **Structure and levels.** Confirmed 1m fractal pivots use two neighbors on
+   each side. The last two highs and last two lows must both rise by at least
+   `0.10` for bullish structure, or both fall by at least `0.10` for bearish
+   structure. Use pivots from the last 60 bars, merge pivots within `0.25`,
+   and require two touches or a session high/low. The nearest opposing level
+   must leave at least `1.0` of room.
+4. **Setup and rejection.** One of the two setups below must complete, with a
+   rejecting last closed 1m candle or latest closed 30s candle. Confirmation
+   requires a rejecting wick at least 40% of range, directional engulfing,
+   or a close in the favorable 40% of range with a body at least 40% of range.
+5. **Filters.** Reject an EMA8 distance greater than `1.2`. Reject chasing
+   when the last three 1m candles all follow the trade direction, each has
+   range at least `1.2`, and `abs(dV) > 2.0`. Reject any of the last three
+   1m candles with range greater than `2.5`.
+6. **Sub-minute votes.** For each of 5s, 10s, 15s, 20s and 30s, the latest
+   closed candle votes bullish when close exceeds open and CLV is at least
+   `0.30`; bearish when close is below open and CLV is at most `-0.30`;
+   otherwise neutral. Require three of five votes aligned, at least two
+   aligned among 15s/20s/30s, and none opposing among those three. An opposing
+   15s candle in the latest three with body at least `1.5 * ATR15s` vetoes.
+7. **Entry timing.** Entry is valid from 5 through 15 seconds after the new
+   minute opens. All other times fail, including after 20 seconds. Current
+   price may differ from the signal-price anchor by no more than `0.15`.
 
----
+### Setup 1: breakout and retest
 
-### **A2: STRATEGY PLANNING**
+A closed 1m candle must break an already known level L by at least `0.15`,
+with body/range at least 0.5 and range at most `2.0`. Retest must occur one
+through six bars later. For bullish entry the retest low must be between
+`L - 0.35` and `L + 0.25`, with close above L. For bearish entry, mirror those
+bounds around L and require close below L. A 1m close more than `0.20` back
+through L cancels the setup. At least two of L, VWAP and EMA8 must be within
+`0.30` of the retest extreme.
 
-**Entry Signal Decision Tree:**
+The ordering is breakout, close, retest, rejection, sub-minute confirmation,
+then entry. A level or pivot must already be confirmed when used; later
+candles cannot retroactively establish a breakout.
 
-```
-IF (Confidence >= 65%) AND (Volatility < 3%) THEN
-   IF Trend = UPTREND → Trade UP (2% profit target)
-   IF Trend = DOWNTREND → Trade DOWN (2% profit target)
+### Setup 2: VWAP retest
 
-ELSE IF (Confidence >= 60%) AND (Volatility < 5%) THEN
-   IF Trend = UPTREND → Trade UP (1.5% profit target)
-   IF Trend = DOWNTREND → Trade DOWN (1.5% profit target)
+After bias is established, a bullish retest requires low at or below
+`VWAP + 0.25`, close above VWAP and no pullback close below `VWAP - 0.10`.
+The bearish method mirrors these comparisons. At least one of EMA8 and the
+confirmed swing low/high must lie within `0.30` of the retest extreme.
+Rejection and subsequent confirmation are still required.
 
-ELSE
-   → HOLD (Wait for next signal)
-```
+## Confidence
 
-**Risk Management Rules:**
-```
-Position Size: $200 per trade (Fixed)
-Take Profit: 1.5% - 2.0% from entry
-Stop Loss: 2.0% from entry
-Hold Time: 5 minutes maximum
-Time Between Trades: 30 seconds minimum
-```
+Weights are VWAP 20, EMA 15, structure 15, breakout/retest 20, level confluence
+10, candle 10 and sub-minute 10. For each passed component the contribution
+is `weight * (0.6 + 0.4 * strength)`, with strength clamped to `[0, 1]`.
+A failed gate contributes zero. Confidence is reported as a whole number.
+All seven hard gates must pass and confidence must be at least 75; waiting
+longer never lowers that threshold.
 
-**Daily Circuit Breaker:**
-```
-IF Daily Loss >= $2,000 THEN
-   Close all open trades
-   Block new entries
-   Log event
-   Wait for next trading day
-```
+The numerical strength anchors, session boundaries, pullback boundaries and
+signal-price anchor are implementation conventions where the supplied Part B
+does not prescribe a value. Their exact deterministic definitions are
+documented with the strategy implementation and must remain consistent with
+its tests; they must not be adjusted dynamically to increase trade frequency.
 
----
+## Output contract
 
-### **A3: TIME EXECUTION**
+The report contains the following fields in this order and no additional fields:
 
-**Execution Flow:**
-
-1. **Entry Phase (0-30 seconds after signal):**
-   - Confirm price at entry level
-   - Execute trade immediately
-   - Log entry time and price
-
-2. **Holding Phase (30 seconds - 5 minutes):**
-   - Monitor price movement
-   - Check profit targets every 30 seconds
-   - Check stop loss every 30 seconds
-   - Track time elapsed
-
-3. **Exit Phase (5 minutes or earlier if TP/SL hit):**
-   - Automatic exit at take profit
-   - Automatic exit at stop loss
-   - Force exit if 5 minutes elapsed
-   - Record final price and P&L
-
-**Exit Priority:**
-1. Stop Loss (most important)
-2. Take Profit
-3. Time-based exit (5 minutes)
-
----
-
-### **A4: REINFORCEMENT LEARNING**
-
-**Learning Loop:**
-
-1. **Trade Outcome Evaluation:**
-   ```
-   IF Exit Price > Entry Price THEN
-      Reward = +1 (WIN)
-      Daily Profit += Amount
-   ELSE IF Exit Price < Entry Price THEN
-      Reward = -1 (LOSS)
-      Daily Loss += Amount
-   ELSE
-      Reward = 0 (BREAK EVEN)
-   ```
-
-2. **Model Updates:**
-   - Track winning strategy combinations
-   - Increase weight for high-confidence signals that win
-   - Reduce weight for high-confidence signals that lose
-   - Adjust volatility thresholds based on outcomes
-
-3. **Daily Statistics:**
-   ```
-   Trades Executed: Count
-   Winning Trades: Count
-   Losing Trades: Count
-   Total Profit: Sum
-   Total Loss: Sum
-   Net P&L: Profit - Loss
-   Win Rate: Wins / Total Trades
-   Max Consecutive Losses: Track for streaks
-   ```
-
-4. **Consecutive Loss Tracking:**
-   ```
-   After 1st loss:  -$200  (9 losses remaining)
-   After 5th loss:  -$1000 (5 losses remaining)
-   After 10th loss: -$2000 (CIRCUIT BREAKER TRIGGERED)
-   ```
-
----
-
-## TRADING DAY EXAMPLE
-
-**Scenario: $10,000 account, $2,000 daily limit, $200 per trade**
-
-```
-TIME         | ACTION                      | P&L       | BALANCE   | STATUS
-─────────────┼─────────────────────────────┼───────────┼───────────┼──────────
-9:00 AM      | A1 Selection: EUR/USD       | -         | $10,000   | Ready
-9:05 AM      | A2 Plans entry (UP signal)  | -         | $10,000   | 
-9:06 AM      | A3 Executes BUY @ 1.0800    | -         | $10,000   | 
-9:11 AM      | A4 Closes @ 1.0816 (+1.5%) | +$200     | $10,200   | WIN ✓
-────────────┼─────────────────────────────┼───────────┼───────────┼──────────
-9:12 AM      | A2 Plans entry (DOWN signal)| -         | $10,200   | 
-9:13 AM      | A3 Executes SELL @ 1.0816  | -         | $10,200   | 
-9:18 AM      | A4 Closes @ 1.0796 (+1.5%) | +$200     | $10,400   | WIN ✓
-────────────┼─────────────────────────────┼───────────┼───────────┼──────────
-9:20 AM      | A2 Plans entry (HIGH VOL)  | -         | $10,400   | 
-9:21 AM      | A3 Executes SELL @ 1.0810  | -         | $10,400   | 
-9:26 AM      | A4 Closes @ 1.0850 (-2.0%) | -$200     | $10,200   | LOSS ✗
-────────────┼─────────────────────────────┼───────────┼───────────┼──────────
-11:30 AM     | A1 Selection: GBP/USD       | -         | $10,200   | Ready
-...          | Continue trading cycle      | -         | -         | -
-────────────┼─────────────────────────────┼───────────┼───────────┼──────────
-AFTER 10     | Daily Loss = $2,000         | -$2,000   | $8,000    | 
-LOSSES       | CIRCUIT BREAKER ACTIVE      | -         | LOCKED    | ⛔ NO MORE TRADES
+```text
+Asset:
+Timestamp:
+Current Price:
+1-Minute Trend:
+VWAP:
+Price vs VWAP:
+8 EMA:
+Price vs 8 EMA:
+Market Structure:
+Important Support:
+Important Resistance:
+Breakout Detected:
+Retest Detected:
+Candlestick Confirmation:
+5s Direction:
+10s Direction:
+15s Direction:
+20s Direction:
+30s Direction:
+Lower-Timeframe Consensus:
+Signal:
+Confidence:
+Expiry:
+Entry Reason:
+Invalidation Reason:
 ```
 
----
+`Signal` is exactly `CALL`, `PUT` or `NO TRADE`. Other fields use bullish and
+bearish language, never the directional signal words. `Expiry` is always
+`1 MINUTE`. `Entry Reason` names the first failed gate for `NO TRADE`.
 
-## RISK MANAGEMENT RULES
+## Development environment
 
-### Position Sizing Formula:
-```
-Risk Per Trade = Account Size × Risk Percentage
-                = $10,000 × 2%
-                = $200
-
-Position Size = Risk Amount / Stop Loss %
-              = $200 / 2%
-              = $10,000 units (contracts)
+```bash
+conda activate tg_algo
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest
 ```
 
-### Daily Limits:
-```
-Maximum Daily Loss: $2,000 (20% of account)
-Minimum Daily Loss Before Stopping: 10 consecutive losses × $200
-
-Daily Loss Tracker:
-├─ Losses 1-3:  -$600   (7 losses left)
-├─ Losses 4-6:  -$1,200 (4 losses left)
-├─ Losses 7-9:  -$1,800 (1 loss left)
-└─ Loss 10:     -$2,000 (STOP - No more trading today)
-```
-
-### Profit Taking Rules:
-```
-Per Trade TP: 1.5% - 2.0%
-Per Trade SL: 2.0%
-
-Daily Profit Target: Unlimited
-Daily Loss Limit: $2,000 hard stop
-
-If Daily Profit > $1,000: Consider reducing trade size
-If Daily Loss > $1,500: Prepare for circuit breaker
-```
-
----
-
-## KEY SUCCESS FACTORS
-
-✅ **DO:**
-1. Execute trades only during scheduled A1 selection windows
-2. Follow A2 strategy rules (confidence + volatility checks)
-3. Respect $200 position size strictly
-4. Close all trades at 5-minute mark
-5. Track daily loss limit religiously
-6. Log all trades for A4 learning
-
-❌ **DON'T:**
-1. Deviate from $200 position size
-2. Hold trades longer than 5 minutes
-3. Ignore the $2,000 daily loss limit
-4. Trade outside A1 selection windows
-5. Over-leverage or size up
-6. Revenge trade after losses
-
----
-
-## ACCOUNT RECOVERY STRATEGY
-
-**If account drops below $8,000:**
-
-1. **Reduce Position Size:** $200 → $150 per trade
-2. **Lower Confidence Threshold:** 65% → 60%
-3. **Fewer Trades:** Focus on high-quality signals only
-4. **Increase Profit Target:** 1.5% → 2.5% (wait for better setups)
-
-**If account recovers to $12,000:**
-
-1. **Return to Base Settings:** $200 per trade
-2. **Increase Daily Limit:** $2,000 → $2,500
-3. **Consider A/B Testing:** Try new strategies on 10% of account
-
----
-
-## PERFORMANCE METRICS TO TRACK
-
-**Daily Metrics:**
-```
-├─ Total Trades: Count
-├─ Winning Trades: Count  
-├─ Losing Trades: Count
-├─ Win Rate: % of winning trades
-├─ Largest Win: $ amount
-├─ Largest Loss: $ amount
-├─ Average Win Size: $
-├─ Average Loss Size: $
-└─ Profit Factor: Total Profit / Total Loss
-```
-
-**Weekly Metrics:**
-```
-├─ Total P&L: $
-├─ Best Day: $ + date
-├─ Worst Day: $ + date
-├─ Consecutive Winning Days: #
-├─ Consecutive Losing Days: #
-└─ Consistency Score: Profit days / Total days
-```
-
-**Monthly Metrics:**
-```
-├─ ROI: % return on $10,000
-├─ Win Rate: % overall
-├─ Sharpe Ratio: Risk-adjusted return
-├─ Max Drawdown: Largest loss from peak
-└─ Strategy Performance: Which A2 strategies worked best
-```
-
----
-
-## IMPLEMENTATION CHECKLIST
-
-- [ ] Configure account size in settings.py: $10,000
-- [ ] Set daily loss limit: $2,000
-- [ ] Set risk per trade: $200
-- [ ] Configure A1 selection times: 9:00, 11:30, 2:00, 4:00 PM
-- [ ] Define A2 confidence thresholds: 60-65%
-- [ ] Set A3 hold time: 5 minutes
-- [ ] Enable A4 learning feedback
-- [ ] Enable daily circuit breaker at $2,000 loss
-- [ ] Log all trades to file
-- [ ] Test on 1-2 days before live trading
-- [ ] Monitor win rate and adjust if < 40%
-- [ ] Prepare recovery strategy if balance drops to $8,000
-
----
-
-## MONTHLY GOALS
-
-**Conservative Target:** 5% return = +$500/month
-- ~20 winning trades at $200 profit each
-- ~20 losing trades at -$200 each
-- Net: +$500 with 50% win rate
-
-**Target Win Rate:** 50-55%
-- Below 40%: Review strategy and reduce size
-- Above 60%: Monitor for over-optimization
-
-**Risk Tolerance:** Maximum 20% loss per month ($2,000)
-- If account hits $8,000: Reduce to $150 per trade
-
----
-
-**Last Updated:** 2026-05-27
-**Strategy Version:** 1.0
-**Status:** Active
+Validation is offline and does not require placing orders.

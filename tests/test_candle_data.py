@@ -226,7 +226,7 @@ def test_invalidating_live_observation_does_not_freshen_cached_native_baseline()
         assert other.forming_snapshot(100)["complete_from_open"] is False
 
 
-def test_feed_suspension_preserves_native_history_sr_and_observed_extremes():
+def test_feed_suspension_preserves_native_history_and_observed_extremes():
     agent = MultiTimeframeAgent("test")
     agent.seed_from_dataframe(history(180), source="broker_native_ws", now=10800)
     agent.seed_from_dataframe(history(180, period=30, start=5400), timeframe=30,
@@ -236,10 +236,8 @@ def test_feed_suspension_preserves_native_history_sr_and_observed_extremes():
                   "ts": 10800, "observed_at": 10801, "source": "broker_native_ws"}
         agent.builders[period].update_forming(1.19, 10801, native=native)
     closed = {period: builder.closed_snapshot() for period, builder in agent.builders.items()}
-    sr = agent.sr_engine
     agent.suspend_live_observations("stale_quote", now=10803)
     assert [len(agent.builders[period]) for period in (30, 60, 300)] == [180, 70, 36]
-    assert agent.sr_engine is sr
     for period, builder in agent.builders.items():
         assert builder.closed_snapshot() == closed[period]
         if period == 300:

@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from strategies.closed_candle import ema, rsi_series
 from strategies.live_monitor import analyze_forming
 
 
@@ -35,36 +34,32 @@ def test_live_ohlc_wicks_direction_and_remaining_are_distinct_from_expiry():
     json.dumps(result, allow_nan=False)
 
 
-@pytest.mark.parametrize("period,fast,slow", [(30, 20, 50), (60, 9, 21)])
-def test_live_indicators_are_recalculated_without_appending_closed_bars(period, fast, slow):
-    values = [10 + (index % 3) * .1 for index in range(60)]
+@pytest.mark.parametrize("period", [30, 60])
+def test_live_ema8_is_recalculated_without_appending_closed_bars(period):
+    values = [10.] * 60
     closed, bar, now = forming(values, period)
     initial = analyze_forming(closed, bar, period, now)
     bar.update(close=9.5, observed_at=now + 1)
     updated = analyze_forming(closed, bar, period, now + 1)
-    assert updated["indicators"][f"ema{fast}"] == ema(values + [9.5], fast)[-1]
-    assert updated["indicators"][f"ema{slow}"] == ema(values + [9.5], slow)[-1]
-    assert updated["indicators"]["rsi14"] == rsi_series(values + [9.5])[-1]
+    assert initial["indicators"]["ema8"] == pytest.approx(10 + 4 / 9)
+    assert updated["indicators"]["ema8"] == pytest.approx(10 - 1 / 9)
+    assert set(updated["indicators"]) == {"ema8", "includes_forming_close"}
     assert initial["indicators"] != updated["indicators"]
     assert len(closed) == 60
     assert updated["candle"]["direction"] == "bearish"
     assert updated["candle"]["remaining_seconds"] == period - 11
 
 
-def test_30s_entry_role_reports_entry_indicators_without_authorizing_forming_bar():
+def test_monitor_roles_share_descriptive_values_without_authorizing_forming_bar():
     values = [10 + (index % 3) * .1 for index in range(60)]
     closed, bar, now = forming(values, 30)
     before = copy.deepcopy((closed, bar))
     trend = analyze_forming(closed, bar, 30, now)
     entry = analyze_forming(closed, bar, 30, now, role="entry")
     assert trend["role"] == "trend" and entry["role"] == "entry"
-    assert trend["indicators"]["ema20"] == ema(values + [12.], 20)[-1]
-    assert entry["indicators"]["ema9"] == ema(values + [12.], 9)[-1]
-    assert entry["indicators"]["ema21"] == ema(values + [12.], 21)[-1]
-    assert "ema20" not in entry["indicators"]
-    assert "price_above_ema21" in entry["provisional_conditions"]
-    assert "range_within_twice_previous_ten" in entry["provisional_conditions"]
-    assert "ema20_and_ema50_rising_three_bars" not in entry["provisional_conditions"]
+    assert entry["indicators"] == trend["indicators"]
+    assert entry["indicators"]["ema8"] is not None
+    assert entry["provisional_conditions"] == trend["provisional_conditions"] == {}
     assert entry["candle"] == trend["candle"]
     assert entry["confirmed_structure"] == trend["confirmed_structure"]
     assert entry["timeframe_seconds"] == 30 and entry["candle"]["remaining_seconds"] == 20
@@ -82,9 +77,8 @@ def test_partial_short_entry_ohlc_cannot_claim_confirmation_range():
     closed, bar, now = forming([10.] * 60, 30)
     bar["partial"] = True
     entry = analyze_forming(closed, bar, 30, now, role="entry")
-    assert entry["status"] == "partial" and entry["indicators"]["ema21"] is not None
-    assert entry["provisional_conditions"]["range_within_twice_previous_ten"] is None
-    assert entry["provisional_conditions"]["low_above_prior_swing_low"] is None
+    assert entry["status"] == "partial" and entry["indicators"]["ema8"] is not None
+    assert entry["provisional_conditions"] == {}
     assert not entry["can_confirm_entry"]
 
 
@@ -148,16 +142,15 @@ def test_partial_ohlc_is_flagged_and_cannot_claim_a_valid_confirmation_range():
     bar["partial"] = True
     result = analyze_forming(closed, bar, 60, now)
     assert result["status"] == "partial" and result["candle"]["partial"]
-    assert result["indicators"]["ema21"] is not None
-    assert result["provisional_conditions"]["range_within_twice_previous_ten"] is None
+    assert result["indicators"]["ema8"] is not None
+    assert result["provisional_conditions"] == {}
     assert result["can_confirm_entry"] is False
 
 
 def test_incomplete_warmup_and_missing_forming_data_do_not_invent_values():
     closed, bar, now = forming([10, 11])
     result = analyze_forming(closed, bar, 30, now)
-    assert result["indicators"]["ema20"] is None
-    assert result["indicators"]["rsi14"] is None
+    assert result["indicators"]["ema8"] is None
     assert analyze_forming(closed, None, 30, now)["reason"] == "forming_candle_unavailable"
 
 

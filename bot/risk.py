@@ -478,7 +478,7 @@ class RiskManager:
         consecutive_losses = 0
         last_loss_at = None
         for item in outcomes:
-            if (consecutive_losses >= 4 and last_loss_at
+            if (consecutive_losses >= 2 and last_loss_at
                     and (datetime.fromisoformat(item["settled_at"]) -
                          datetime.fromisoformat(last_loss_at)).total_seconds() >= 300):
                 consecutive_losses = 0

@@ -16,6 +16,14 @@ from bot.risk import RiskManager, TradeRecord
 from agents.agent_pipeline_supervisor import CircuitBreaker, PipelineSupervisorAgent
 
 
+def strategy_result(direction="BUY", *, passed=True, reason="Part B confirmed", gate=None):
+    """Isolate execution mechanics from the separately tested Part B engine."""
+    return {"signal": ("CALL" if direction == "BUY" else "PUT") if passed else "NO TRADE",
+            "confidence": 95 if passed else 0, "reason": reason, "first_failed_gate": gate,
+            "metrics": {"atr1m": 1.0}, "fields": {}, "report": "Signal: " + (
+                ("CALL" if direction == "BUY" else "PUT") if passed else "NO TRADE")}
+
+
 def make_system(monkeypatch, tmp_path, entry_seconds=60, direction="BUY"):
     s = runtime.MultiAgentTradingSystem.__new__(runtime.MultiAgentTradingSystem)
     s.entry_seconds = entry_seconds
@@ -66,16 +74,12 @@ def make_system(monkeypatch, tmp_path, entry_seconds=60, direction="BUY"):
     s.risk = RiskManager(max_daily_trades=20, max_daily_loss=2000)
     s.risk.record_trade = Mock(wraps=s.risk.record_trade)
     s.risk.update_pnl_and_journal = Mock(wraps=s.risk.update_pnl_and_journal)
-    clock = SimpleNamespace(now=121.0)
+    clock = SimpleNamespace(now=125.0)
     monkeypatch.setattr(runtime.time, "time", lambda: clock.now)
     s._quote = {"price": 1.105, "observed_at": clock.now}
-    s._five_minute_filter = lambda direction=direction: {
-        "passed": True, "reason": "5m_bullish" if direction == "BUY" else "5m_bearish",
-        "vote": direction}
-    monkeypatch.setattr(runtime, "evaluate_both", lambda *args: {
-        side: {"passed": side == direction, "entry_close": 1.105}
-        for side in ("BUY", "SELL")
-    })
+    monkeypatch.setattr(runtime, "evaluate_strategy", lambda *args, **kwargs: strategy_result(direction))
+    s.signal_log = Mock()
+    monkeypatch.setattr(runtime, "append_signal_log_row", s.signal_log)
     return s, bars, clock
 
 
@@ -84,51 +88,18 @@ def advance(bars, seconds):
         bars[period].append(dict(bars[period][-1], ts=bars[period][-1]["ts"] + seconds))
 
 
-def test_legacy_evaluator_call_uses_supported_signature(monkeypatch, tmp_path, caplog):
-    s, bars, clock = make_system(monkeypatch, tmp_path)
-    seen = {}
-
-    def legacy(*args):
-        seen["args"] = args
-        return {
-            "BUY": {"passed": True, "rise": True, "reason": "ok", "entry_close": 1.105},
-            "SELL": {"passed": False, "reason": "not_buy", "entry_close": 1.105},
-        }
-
-    monkeypatch.setattr(runtime, "select_entry_evaluator", lambda: legacy)
-    monkeypatch.setattr(runtime.settings, "DEMO_STRATEGY_ENABLED", False)
-    bars[30].append(dict(bars[30][-1], ts=120.0))
-    clock.now = 121.0
-    s._quote["observed_at"] = clock.now
-    with caplog.at_level(logging.INFO, logger="multi_agent_orchestrator"):
-        asyncio.run(s._evaluate_and_trade(1.105))
-    assert len(seen["args"]) == 3
-    assert seen["args"][2] == 60
-    assert "awaiting_closed_confirmation" in caplog.text or "NO TRADE" in caplog.text
 
 
-def test_new_30s_bar_logs_both_gates_without_executing_old_1m_setup(monkeypatch, tmp_path, caplog):
-    s, bars, clock = make_system(monkeypatch, tmp_path)
-    s._last_evaluation_key = (90.0, 60.0)
-    bars[30].append(dict(bars[30][-1], ts=120.0))
-    clock.now = 151.0
-    s._quote["observed_at"] = clock.now
-    with caplog.at_level(logging.INFO, logger="multi_agent_orchestrator"):
-        asyncio.run(s._evaluate_and_trade(1.105))
-    assert sum("OnlyGate]" in record.message for record in caplog.records) == 2
-    s.bot.get_asset_payout.assert_not_awaited()
-    s.supervisor.safe_execute_trade.assert_not_awaited()
-    assert not s._order_state_path.exists()
 
 
 def test_delayed_confirmation_never_submits_even_with_new_entry(monkeypatch, tmp_path, caplog):
     s, _, clock = make_system(monkeypatch, tmp_path)
-    clock.now = 126.0  # Closed at 120; beyond the existing five-second decision window.
+    clock.now = 136.0  # Closed at 120; outside Part B's 5-15 second window.
     s._quote["observed_at"] = clock.now
     with caplog.at_level(logging.INFO, logger="multi_agent_orchestrator"):
         asyncio.run(s._evaluate_and_trade(1.105))
     s.supervisor.safe_execute_trade.assert_not_awaited()
-    assert any("stale_confirmation" in record.message for record in caplog.records)
+    assert s.latest_decision["decision"] == "NO TRADE"
     assert not s._order_state_path.exists()
 
 
@@ -170,7 +141,7 @@ def test_uncertain_submission_persists_and_blocks_next_fresh_minute(monkeypatch,
     async def run():
         await s._evaluate_and_trade(1.105)
         advance(bars, 60)
-        clock.now = 181.0
+        clock.now = 185.0
         s._quote["observed_at"] = clock.now
         await s._evaluate_and_trade(1.105)
 
@@ -213,7 +184,7 @@ def test_canceled_submission_remains_unresolved_and_blocks_next_minute(monkeypat
         for period, history in bars.items():
             for _ in range(60 // period):
                 history.append(dict(history[-1], ts=history[-1]["ts"] + period))
-        clock.now = 181.0
+        clock.now = 185.0
         s._quote["observed_at"] = clock.now
         result = await s._evaluate_and_trade(1.105)
         assert result["reason"] == "order_unresolved"
@@ -255,41 +226,27 @@ def test_rejected_setup_remains_consumed_after_restart(monkeypatch, tmp_path):
     assert not restored._execution_uncertain
 
 
-@pytest.mark.parametrize("entry_seconds", [30, 60])
 @pytest.mark.parametrize("first_direction", ["BUY", "SELL"])
 def test_rejected_entry_cannot_be_retried_in_opposite_direction(monkeypatch, tmp_path,
-                                                              entry_seconds, first_direction):
-    s, _, _ = make_system(monkeypatch, tmp_path, entry_seconds, direction=first_direction)
+                                                              first_direction):
+    s, _, _ = make_system(monkeypatch, tmp_path, direction=first_direction)
 
     async def run():
         first = await s._evaluate_and_trade(1.105)
         assert first["reason"] == "execution_rejected"
         opposite = "SELL" if first_direction == "BUY" else "BUY"
-        monkeypatch.setattr(runtime, "evaluate_both", lambda *args: {
-            side: {"passed": side == opposite, "entry_close": 1.105}
-            for side in ("BUY", "SELL")})
+        monkeypatch.setattr(runtime, "evaluate_strategy", lambda *args, **kwargs: strategy_result(opposite))
         result = await s._evaluate_and_trade(1.105)
         assert result["direction"] == opposite
         assert result["reason"] == "setup_already_attempted"
 
     asyncio.run(run())
     s.supervisor.safe_execute_trade.assert_awaited_once()
-    restored = restore_system(monkeypatch, tmp_path, None, entry_seconds=entry_seconds)
-    assert restored._setup_already_attempted(120 - entry_seconds)
+    restored = restore_system(monkeypatch, tmp_path, None)
+    assert restored._setup_already_attempted(60)
     s.risk.record_trade.assert_not_called()
 
 
-def test_conflicting_directional_passes_do_not_submit_or_consume_setup(monkeypatch, tmp_path):
-    s, _, _ = make_system(monkeypatch, tmp_path)
-    monkeypatch.setattr(runtime, "evaluate_both", lambda *args: {
-        side: {"passed": True, "entry_close": 1.105} for side in ("BUY", "SELL")})
-    result = asyncio.run(s._evaluate_and_trade(1.105))
-    assert result["direction"] is None
-    assert result["reason"] == "conflicting_directional_setups"
-    assert result["decision"] in {"WAIT", "NO TRADE"}
-    s.bot.get_asset_payout.assert_not_awaited()
-    s.supervisor.safe_execute_trade.assert_not_awaited()
-    assert not s._attempted_setup_path.exists()
 
 
 def test_overlapping_decision_tasks_serialize_one_order(monkeypatch, tmp_path):
@@ -309,7 +266,7 @@ def test_overlapping_decision_tasks_serialize_one_order(monkeypatch, tmp_path):
         await submitting.wait()
         # A second completed minute arrives while the first click is unresolved.
         advance(bars, 60)
-        clock.now = 181.0
+        clock.now = 185.0
         s._quote["observed_at"] = clock.now
         second = asyncio.create_task(s._evaluate_and_trade(1.105))
         await asyncio.sleep(0)
@@ -397,9 +354,7 @@ def restore_system(monkeypatch, tmp_path, state, entry_seconds=60):
     risk.record_trade = Mock(wraps=risk.record_trade)
     monkeypatch.setattr(runtime, "RiskManager", lambda **kwargs: risk)
     # Keep actual state restoration but replace services with inert dependencies.
-    for name in ("OlymtradeBot", "AssetSelectorAgent", "RLFeedbackAgent",
-                 "RegimeDetector", "ChartAnalyzer", "MultiTimeframeConsensusAnalyzer",
-                 "PipelineSupervisorAgent"):
+    for name in ("OlymtradeBot", "AssetSelectorAgent", "PipelineSupervisorAgent"):
         monkeypatch.setattr(runtime, name, lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(runtime, "PipelineSupervisorAgent",
                         lambda *args, **kwargs: SimpleNamespace(cb=CircuitBreaker()))
@@ -455,130 +410,3 @@ def test_process_lock_excludes_an_independent_process_then_releases(tmp_path):
         assert blocked.returncode == 23, blocked.stderr
     allowed = subprocess.run(command, capture_output=True, text=True, timeout=10)
     assert allowed.returncode == 0, allowed.stderr
-
-
-@pytest.mark.parametrize("side", ["BUY", "SELL"])
-@pytest.mark.parametrize("delay", [2.0, 6.0])
-def test_real_passing_setup_survives_delayed_trend_response_only_within_window(
-        monkeypatch, tmp_path, side, delay):
-    from test_closed_strategy import buy_fixture, mirror
-    from strategies.closed_candle import evaluate_both
-    from agents.agent_pipeline_supervisor import PipelineSupervisorAgent
-    from models.predictor import Signal
-    s, bars, clock = make_system(monkeypatch, tmp_path, direction=side)
-    trend, entry = buy_fixture()
-    if side == "SELL":
-        trend, entry = mirror(trend), mirror(entry)
-    assert evaluate_both(trend, entry)[side]["passed"]
-    monkeypatch.setattr(runtime, "evaluate_both", evaluate_both)
-    monkeypatch.setattr(runtime.settings, "TRADE_AMOUNT", 200.0)
-    monkeypatch.setattr(runtime.settings, "FTT_DURATION", 60)
-    monkeypatch.setattr(runtime.settings, "TRAINING_MODE", False)
-    s.bot.last_order.update(amount=200.0)
-    s.bot.place_ftt_trade = AsyncMock(return_value=True)
-    # Real gate -> real supervisor -> real journal risk; only broker I/O is fake.
-    s.supervisor = PipelineSupervisorAgent(s.bot, s.risk, s.agent1, None)
-    s.supervisor._current_asset = s._current_asset
-    bars[30][:] = trend[:-1]
-    bars[60][:] = entry
-    s._last_evaluation_key = (trend[-2]["ts"], entry[-2]["ts"])
-    clock.now = 2401.0
-    s._quote["observed_at"] = clock.now
-    async def run():
-        await s._evaluate_and_trade(entry[-1]["close"])
-        s.bot.place_ftt_trade.assert_not_awaited()
-        assert s._last_attempted_entry is None
-        bars[30].append(trend[-1])
-        clock.now = 2400.0 + delay
-        s._quote["observed_at"] = clock.now
-        await s._evaluate_and_trade(entry[-1]["close"])
-        await s._evaluate_and_trade(entry[-1]["close"])
-    asyncio.run(run())
-    if delay <= s.CONFIRMATION_WINDOW:
-        s.bot.place_ftt_trade.assert_awaited_once_with(
-            Signal.BUY if side == "BUY" else Signal.SELL, 60, asset=s._current_asset,
-            entry_deadline=2405.0)
-        assert s._accepted_count == 1
-        assert s.risk.daily_snapshot()["accepted_count"] == 1
-        assert s.active_trades[0]["signal"] == side
-    else:
-        s.bot.place_ftt_trade.assert_not_awaited()
-        assert s._accepted_count == 0
-        assert not s._order_state_path.exists()
-
-
-@pytest.mark.parametrize("bullish_filter", [True, False])
-@pytest.mark.parametrize("side", ["BUY", "SELL"])
-def test_real_closed_setup_and_five_minute_filter_reach_broker_only_when_both_pass(
-        monkeypatch, tmp_path, bullish_filter, side):
-    from test_closed_strategy import buy_fixture, mirror
-    from strategies.closed_candle import evaluate_both
-
-    s, bars, clock = make_system(monkeypatch, tmp_path)
-    trend, entry = buy_fixture()
-    assert evaluate_both(trend, entry)["BUY"]["passed"]
-    monkeypatch.setattr(runtime, "evaluate_both", evaluate_both)
-    monkeypatch.setattr(runtime.settings, "TRADE_AMOUNT", 200.0)
-    monkeypatch.setattr(runtime.settings, "FTT_DURATION", 60)
-    monkeypatch.setattr(runtime.settings, "TRAINING_MODE", False)
-
-    # Both broader histories end in the exact same passing 1m BUY candles.
-    # Earlier prices determine whether the real 5m EMA direction permits entry.
-    prefix = []
-    for index in range(80):
-        close = 95 + index * .03 if bullish_filter else 150 - index * .3
-        prefix.append(dict(open=close, close=close, high=close + .15, low=close - .15,
-                           ts=-4800 + index * 60))
-    minutes = prefix + entry
-    five_minute = []
-    for index in range(0, len(minutes), 5):
-        group = minutes[index:index + 5]
-        five_minute.append(dict(open=group[0]["open"], close=group[-1]["close"],
-                                high=max(bar["high"] for bar in group),
-                                low=min(bar["low"] for bar in group), ts=group[0]["ts"],
-                                source="complete_test_minute_aggregation"))
-    if side == "SELL":
-        trend, entry, five_minute = mirror(trend), mirror(entry), mirror(five_minute)
-    bars[30][:], bars[60][:] = trend, entry
-    s.agent1.builders[300] = SimpleNamespace(closed_snapshot=lambda: list(five_minute))
-    del s._five_minute_filter  # Use the runtime's real completed-5m EMA filter.
-    clock.now = 2401.0
-    s._quote.update(price=entry[-1]["close"], observed_at=clock.now)
-    actual_filter = s._five_minute_filter(side)
-    assert actual_filter["count"] == actual_filter["required"] == 24
-    is_bullish = bullish_filter if side == "BUY" else not bullish_filter
-    assert actual_filter["direction"] == ("bullish" if is_bullish else "bearish")
-    assert actual_filter["passed"] is bullish_filter
-
-    s.bot.last_order.update(amount=200.0)
-    s.bot.place_ftt_trade = AsyncMock(return_value=True)
-    s.risk.approve = Mock(wraps=s.risk.approve)
-    s.supervisor = PipelineSupervisorAgent(s.bot, s.risk, s.agent1, None)
-    s.supervisor._current_asset = s._current_asset
-
-    async def run():
-        result = await s._evaluate_and_trade(entry[-1]["close"])
-        assert result[f"{side.lower()}_evaluation"]["passed"]
-        assert result["entry_evaluation"] == result[f"{side.lower()}_evaluation"]
-        assert result["direction"] == side
-        assert result["trend_filter_5m"]["passed"] is bullish_filter
-        assert result["reason"] == ("order_accepted" if bullish_filter else
-                                    "5m_bearish" if side == "BUY" else "5m_bullish")
-        await s._evaluate_and_trade(entry[-1]["close"])
-
-    asyncio.run(run())
-    if bullish_filter:
-        s.bot.place_ftt_trade.assert_awaited_once_with(
-            runtime.Signal[side], 60, asset=s._current_asset, entry_deadline=2405.0)
-        s.risk.approve.assert_called_once()
-        s.risk.record_trade.assert_called_once()
-        assert s._accepted_count == s.risk.daily_snapshot()["accepted_count"] == 1
-        assert len(s.active_trades) == 1
-        assert json.loads(s._order_state_path.read_text())["status"] == "accepted"
-    else:
-        s.bot.place_ftt_trade.assert_not_awaited()
-        s.risk.approve.assert_not_called()
-        s.risk.record_trade.assert_not_called()
-        assert s._accepted_count == s.risk.daily_snapshot()["accepted_count"] == 0
-        assert not s._order_state_path.exists()
-        assert s._last_attempted_entry is None

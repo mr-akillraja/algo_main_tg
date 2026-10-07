@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import multi_agent_orchestrator as runtime
-from strategies.closed_candle import evaluate_both
+from strategies.part_b import evaluate_strategy
 from test_candle_data import history
 from test_monitoring_runtime import monitoring_system
 
@@ -22,8 +22,7 @@ def test_quote_age_2_002_seconds_preserves_native_history_through_recovery(monke
     clock.now = 10801.0
     system.observe_only = True
     populate_native_history(system)
-    monkeypatch.setattr(runtime, "evaluate_both", evaluate_both)
-    system._five_minute_filter = runtime.MultiAgentTradingSystem._five_minute_filter.__get__(system)
+    monkeypatch.setattr(runtime, "evaluate_strategy", evaluate_strategy)
     before = {period: builder.closed_snapshot() for period, builder in system.agent1.builders.items()}
     recorded_counts = []
     publish = system._publish_decision
@@ -50,8 +49,7 @@ def test_quote_age_2_002_seconds_preserves_native_history_through_recovery(monke
     assert sleeps == [1.0] * 5
     assert recorded_counts == [[180, 70, 35]] * 5
     assert {p: b.closed_snapshot() for p, b in system.agent1.builders.items()} == before
-    assert all(d["buy_evaluation"]["reason"] != "insufficient_closed_candles" for d in decisions)
-    assert all(d["trend_filter_5m"]["closed_ts"] == 10500 for d in decisions)
+    assert all(d["decision"] == "NO TRADE" for d in decisions)
 
     stale = decisions[2]
     assert stale["evaluated_at"] - stale["quote_observed_at"] == pytest.approx(2.002)
@@ -68,6 +66,32 @@ def test_quote_age_2_002_seconds_preserves_native_history_through_recovery(monke
         assert not decisions[4]["candles"][period]["candle"]["partial"]
         assert decisions[4]["candles"][period]["candle"]["native_observed_at"] == 10805
     system.supervisor.safe_execute_trade.assert_not_awaited()
+
+
+def test_monitor_formatter_shows_close_price_not_timestamp(monkeypatch, tmp_path):
+    """Fail if MonitorConsoleFormatter prints a timestamp-sized number for close price."""
+    from multi_agent_orchestrator import MonitorConsoleFormatter
+    fmt = MonitorConsoleFormatter()
+    # Build a fake record with Decision message payload
+    payload = {
+        "decision": "NO TRADE",
+        "blocking_stage": "data",
+        "reason": "test",
+        "buy_evaluation": {},
+        "entry_timeframe_seconds": 30,
+        "closed_candles": {"30": {"close": 1.2345, "open_ts": 1000}, "60": {"close": 1.2346, "open_ts": 960}},
+        "trend_closed_ts": 1000,
+        "entry_closed_ts": 1000,
+    }
+    import logging
+    record = logging.LogRecord(name="multi_agent_orchestrator", level=logging.INFO, pathname=__file__, lineno=1, msg=f"[Decision] {__import__('json').dumps(payload)}", args=(), exc_info=None)
+    out = fmt.format(record)
+    # Extract printed trend.30s.closed=value token
+    import re
+    m = re.search(r"trend\.30s\.closed=([^ ]+)", out)
+    assert m, "Formatter missing trend.30s.closed"
+    val = float(m.group(1))
+    assert val < 1e9, "Formatter printed a timestamp-sized number instead of a price"
 
 
 def test_actual_background_helpers_wait_without_interrupting_monitor_cadence(monkeypatch, tmp_path):
@@ -144,7 +168,7 @@ def test_actual_background_helpers_wait_without_interrupting_monitor_cadence(mon
     assert set(starts) == {"native_30", "native_60", "market_refresh", "settlement"}
     assert {task.get_coro().__name__ for task in system._bg_tasks} == {
         "_daily_reset_monitor", "_settlement_loop", "_native_refresh_loop", "_market_refresh_loop",
-        "_chart_display_loop"}
+        "_chart_display_loop", "_feed_watchdog_loop"}
     assert all(task.done() for task in system._bg_tasks)
     assert all(d["reason"] == "stale_candle_snapshot" for d in decisions)
     assert all(d["quote_status"] == "fresh" and d["closed_candle_status"] == "stale_or_unavailable"

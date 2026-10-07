@@ -8,7 +8,7 @@ import pytest
 import multi_agent_orchestrator as runtime
 from agents.agent_multi_timeframe import MultiTimeframeAgent
 from models.predictor import Signal
-from test_execution_state import make_system
+from test_execution_state import make_system, strategy_result
 
 
 def monitoring_system(monkeypatch, tmp_path, direction="BUY"):
@@ -18,9 +18,6 @@ def monitoring_system(monkeypatch, tmp_path, direction="BUY"):
         system.agent1.builders[period].candles.extend(bars[period])
     system._seed_sources = {30: "broker_native_ws", 60: "broker_native_ws"}
     system._quote = {"price": 1.105, "observed_at": clock.now, "read_at": clock.now}
-    system._five_minute_filter = Mock(side_effect=lambda requested="BUY": {
-        "passed": requested == direction,
-        "reason": "5m_bullish" if direction == "BUY" else "5m_bearish", "vote": direction})
     system.latest_decision = None
     system._feed_missing = False
     system._decision_tasks = set()
@@ -36,7 +33,7 @@ def monitoring_system(monkeypatch, tmp_path, direction="BUY"):
     system.bot.get_native_forming_candle = Mock(side_effect=native_forming)
 
     async def fresh_quote(asset):
-        return {"price": 1.105 + (clock.now - 121) / 10000,
+        return {"price": 1.105 + (clock.now - 125) / 10000,
                 "observed_at": clock.now, "read_at": clock.now}
 
     system.bot.get_current_quote = AsyncMock(side_effect=fresh_quote)
@@ -75,7 +72,7 @@ def test_run_evaluates_fresh_quotes_and_both_forming_bars_every_second(monkeypat
     system.observe_only = True
     asyncio.run(system.run(lock_acquired=True))
 
-    assert [decision["evaluated_at"] for decision in decisions] == [121, 122, 123, 124, 125]
+    assert [decision["evaluated_at"] for decision in decisions] == [125, 126, 127, 128, 129]
     assert sleeps == [1.0] * 5
     assert system.bot.get_current_quote.await_count == 5
     assert len({decision["live_price"] for decision in decisions}) == 5
@@ -83,7 +80,7 @@ def test_run_evaluates_fresh_quotes_and_both_forming_bars_every_second(monkeypat
         candles = [decision["candles"][str(period)] for decision in decisions]
         assert all(candle["current"] and candle["provisional"] for candle in candles)
         assert all(not candle["can_confirm_entry"] for candle in candles)
-        expected_remaining = [29, 28, 27, 26, 25] if period == 30 else [59, 58, 57, 56, 55]
+        expected_remaining = [25, 24, 23, 22, 21] if period == 30 else [55, 54, 53, 52, 51]
         assert [candle["candle"]["remaining_seconds"] for candle in candles] == expected_remaining
     system.supervisor.safe_execute_trade.assert_not_awaited()
 
@@ -93,22 +90,22 @@ def test_stale_tick_still_publishes_a_decision_without_current_price(monkeypatch
     system.observe_only = True
 
     async def quote(asset):
-        return {"price": 1.105, "observed_at": clock.now - (3 if clock.now == 123 else 0),
-                "read_at": clock.now, "stale": clock.now == 123}
+        return {"price": 1.105, "observed_at": clock.now - (3 if clock.now == 127 else 0),
+                "read_at": clock.now, "stale": clock.now == 127}
 
     system.bot.get_current_quote.side_effect = quote
     before = {period: builder.closed_snapshot() for period, builder in system.agent1.builders.items()}
     asyncio.run(system.run(lock_acquired=True))
     assert len(decisions) == 5
     stale = decisions[2]
-    assert stale["evaluated_at"] == 123
+    assert stale["evaluated_at"] == 127
     assert stale["decision"] == "NO TRADE"
     assert stale["data_status"] == "stale_or_unavailable"
     assert stale["live_price"] is None
     assert all(candle["live_price"] is None and not candle["current"]
                for candle in stale["candles"].values())
     assert {period: builder.closed_snapshot() for period, builder in system.agent1.builders.items()} == before
-    assert decisions[3]["buy_evaluation"]["passed"]
+    assert decisions[3]["entry_evaluation"]["passed"]
 
 
 def test_source_marked_stale_cannot_publish_current_forming_values(monkeypatch, tmp_path):
@@ -141,51 +138,35 @@ def test_quote_expiring_during_payout_check_prevents_order(monkeypatch, tmp_path
     system._update_forming_candles(1.105)
 
     async def payout(asset):
-        clock.now = 124
+        clock.now = 128
         return .85
 
     system.bot.get_asset_payout.side_effect = payout
     asyncio.run(system._evaluate_and_trade(1.105))
-    assert [decision["decision"] for decision in decisions] == ["WAIT", "NO TRADE"]
+    assert [decision["decision"] for decision in decisions] == ["NO TRADE", "NO TRADE"]
     assert decisions[0]["reason"] == "checking_demo_order_conditions"
     assert decisions[-1]["reason"] == "quote_expired_during_preflight"
-    assert decisions[-1]["evaluated_at"] == 124
+    assert decisions[-1]["evaluated_at"] == 128
     assert decisions[-1]["live_price"] is None
     system.supervisor.safe_execute_trade.assert_not_awaited()
 
 
-def test_sell_confirmation_cannot_authorize_entry_against_bullish_filter(monkeypatch, tmp_path):
-    system, _, _, _ = monitoring_system(monkeypatch, tmp_path)
-    system._quote["price"] = 1.12
-    system._update_forming_candles(1.12)
-    monkeypatch.setattr(runtime, "evaluate_both", lambda *args: {
-        "BUY": {"passed": False, "reason": "awaiting_closed_buy_confirmation"},
-        "SELL": {"passed": True, "reason": "closed_candle_setup_confirmed"},
-    })
-    asyncio.run(system._evaluate_and_trade(1.12))
-    assert system.latest_decision["decision"] == "NO TRADE"
-    assert system.latest_decision["direction"] == "SELL"
-    assert system.latest_decision["reason"] == "5m_bullish"
-    assert system.latest_decision["blocking_stage"] == "trend_filter"
-    assert system.latest_decision["candles"]["30"]["candle"]["direction"] == "bullish"
-    assert system.latest_decision["candles"]["60"]["candle"]["direction"] == "bullish"
-    system.supervisor.safe_execute_trade.assert_not_awaited()
 
 
 def test_repeated_seconds_submit_a_confirmed_buy_setup_only_once(monkeypatch, tmp_path):
     system, _, decisions, _ = monitoring_system(monkeypatch, tmp_path)
     system.supervisor.safe_execute_trade.return_value = True
-    system.bot.last_order["accepted_at"] = 121.75
+    system.bot.last_order["accepted_at"] = 125.75
     asyncio.run(system.run(lock_acquired=True))
-    system.supervisor.safe_execute_trade.assert_awaited_once_with(Signal.BUY, .95, "ftt", entry_deadline=125.0)
+    system.supervisor.safe_execute_trade.assert_awaited_once_with(Signal.BUY, .95, "ftt", entry_deadline=135.0)
     assert len(system.active_trades) == 1
-    assert system.active_trades[0]["accepted_at"] == 121.75
+    assert system.active_trades[0]["accepted_at"] == 125.75
     assert system.active_trades[0]["duration"] == 60
-    assert [decision["decision"] for decision in decisions[:3]] == ["WAIT", "BUY", "BUY"]
+    assert [decision["decision"] for decision in decisions[:3]] == ["NO TRADE", "BUY", "BUY"]
     assert decisions[0]["reason"] == "checking_demo_order_conditions"
     assert decisions[2]["reason"] == "order_accepted"
     assert decisions[2]["accepted_orders_this_run"] == 1
-    assert all(decision["decision"] == "WAIT" for decision in decisions[3:])
+    assert all(decision["decision"] == "NO TRADE" for decision in decisions[3:])
 
 
 def test_slow_execution_does_not_suspend_per_second_market_decisions(monkeypatch, tmp_path):
@@ -207,19 +188,19 @@ def test_slow_execution_does_not_suspend_per_second_market_decisions(monkeypatch
         await system.run(lock_acquired=True)
 
     asyncio.run(run())
-    assert [decision["evaluated_at"] for decision in decisions[:6]] == [121, 121, 122, 123, 124, 125]
-    assert [decision["decision"] for decision in decisions] == ["WAIT", "BUY", "WAIT", "WAIT", "WAIT", "WAIT", "BUY"]
+    assert [decision["evaluated_at"] for decision in decisions[:6]] == [125, 125, 126, 127, 128, 129]
+    assert [decision["decision"] for decision in decisions] == ["NO TRADE", "BUY", "NO TRADE", "NO TRADE", "NO TRADE", "NO TRADE", "BUY"]
     assert decisions[0]["reason"] == "checking_demo_order_conditions"
     assert all(decision["reason"] == "order_unresolved" for decision in decisions[2:6])
     assert decisions[-1]["reason"] == "order_accepted"
     assert decisions[-1]["evaluated_at"] >= decisions[-2]["evaluated_at"]
-    assert decisions[-1]["submission_evaluated_at"] == 121
+    assert decisions[-1]["submission_evaluated_at"] == 125
     system.supervisor.safe_execute_trade.assert_awaited_once()
     assert len(system.active_trades) == 1
 
 
 def test_slow_payout_check_publishes_first_tick_and_keeps_monitoring(monkeypatch, tmp_path):
-    system, _, decisions, _ = monitoring_system(monkeypatch, tmp_path)
+    system, clock, decisions, _ = monitoring_system(monkeypatch, tmp_path)
 
     async def run():
         release = asyncio.Event()
@@ -229,6 +210,7 @@ def test_slow_payout_check_publishes_first_tick_and_keeps_monitoring(monkeypatch
             return .85
 
         async def finish():
+            clock.now = 136
             release.set()
             await asyncio.gather(*system._decision_tasks)
 
@@ -237,8 +219,8 @@ def test_slow_payout_check_publishes_first_tick_and_keeps_monitoring(monkeypatch
         await system.run(lock_acquired=True)
 
     asyncio.run(run())
-    assert [decision["evaluated_at"] for decision in decisions[:5]] == [121, 122, 123, 124, 125]
-    assert all(decision["decision"] == "WAIT" for decision in decisions)
+    assert [decision["evaluated_at"] for decision in decisions[:5]] == [125, 126, 127, 128, 129]
+    assert all(decision["decision"] == "NO TRADE" for decision in decisions)
     assert decisions[0]["reason"] == "checking_demo_order_conditions"
     assert all(decision["reason"] == "order_unresolved" for decision in decisions[1:5])
     assert decisions[-1]["reason"] == "awaiting_next_closed_confirmation"
@@ -256,13 +238,9 @@ def test_observe_only_cannot_call_stale_closed_trend_a_buy(monkeypatch, tmp_path
     assert system.latest_decision["reason"] == "stale_candle_snapshot"
 
 
-def test_fresh_quote_does_not_hide_stale_history_behind_failed_entry_rule(monkeypatch, tmp_path):
+def test_fresh_quote_does_not_hide_stale_history(monkeypatch, tmp_path):
     system, _, _, _ = monitoring_system(monkeypatch, tmp_path)
     system.agent1.builders[30].candles[-1]["ts"] = 60
-    monkeypatch.setattr(runtime, "evaluate_both", lambda *args: {
-        "BUY": {"passed": False, "reason": "1m_close_vs_ema21", "failed_rules": ["1m_close_vs_ema21"]},
-        "SELL": {"passed": False},
-    })
     asyncio.run(system._evaluate_and_trade(1.105))
     result = system.latest_decision
     assert result["quote_status"] == "fresh"
@@ -300,7 +278,7 @@ def test_rejected_submission_replaces_confirmation_with_actual_result(monkeypatc
     assert result["execution_detail"] == "broker_order_not_accepted"
     assert result["accepted_orders_this_run"] == 0
     assert result["direction"] == direction
-    assert result["entry_evaluation"] == result[f"{direction.lower()}_evaluation"]
+    assert result["entry_evaluation"]["signal"] == ("CALL" if direction == "BUY" else "PUT")
 
 
 @pytest.mark.parametrize("second", [0, 2, 5, 9, 41, 55, 59])
@@ -347,7 +325,7 @@ def test_chart_probe_does_not_hide_actual_failed_entry_rules(monkeypatch, tmp_pa
 def test_console_summary_does_not_alter_full_json_for_file_handlers(entry_seconds, entry_label):
     import json
     import logging
-    payload = {"decision": "WAIT", "blocking_stage": "entry_rules", "reason": "1m_rsi14_band",
+    payload = {"decision": "NO TRADE", "blocking_stage": "entry_rules", "reason": "1m_rsi14_band",
                "entry_timeframe_seconds": entry_seconds,
                "quote_status": "fresh", "quote_age_seconds": .125,
                "closed_candle_status": "fresh", "stale_closed_timeframes": [],
@@ -440,7 +418,6 @@ def test_monitor_candle_and_expiry_settings_are_distinct(monkeypatch, tmp_path):
     system, _, _, _ = monitoring_system(monkeypatch, tmp_path)
     assert runtime.settings.POLL_INTERVAL == system.TICK_INTERVAL == system.DECISION_INTERVAL == 1
     assert runtime.settings.ACTIVE_CANDLE_SECONDS == (30, 60)
-    assert runtime.settings.TREND_FILTER_SECONDS == 300
     assert runtime.settings.FTT_DURATION == runtime.FTT_DURATION_S == 60
     system.observe_only = True
     asyncio.run(system._evaluate_and_trade(1.105))

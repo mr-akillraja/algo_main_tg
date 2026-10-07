@@ -7,7 +7,7 @@ and confirmed structure always use completed candles only.
 
 import math
 
-from strategies.closed_candle import _valid_candles, confirmed_swings, ema, rsi_series
+from strategies.candle_math import valid_candles, confirmed_swings, ema
 
 
 def _progression(points, higher, lower):
@@ -55,9 +55,9 @@ def analyze_forming(closed, forming, period, now, *, max_age_seconds=2.0, role=N
     current values; a history gap retains fresh candle geometry but suppresses
     indicators and structure. This function never mutates inputs.
 
-    ``role="entry"`` applies entry EMA9/21 diagnostics to either candle period.
-    The default preserves the existing 30-second trend and 60-second entry
-    diagnostics. Every role remains provisional and cannot confirm an entry.
+    ``role`` labels the monitored candle without changing its calculations.
+    EMA8 is descriptive; every role remains provisional and cannot confirm an
+    entry or apply strategy gates.
     """
     if period not in (30, 60):
         raise ValueError("Active monitoring requires 30-second or 60-second candles")
@@ -79,7 +79,7 @@ def analyze_forming(closed, forming, period, now, *, max_age_seconds=2.0, role=N
         return result
     bars = [dict(candle) for candle in closed]
     current = dict(forming)
-    if not _valid_candles(bars + [current]):
+    if not valid_candles(bars + [current]):
         return dict(result, status="invalid", reason="invalid_ohlc_or_timestamps")
     start = float(current["ts"])
     observed = current.get("observed_at", current.get("updated_at"))
@@ -132,20 +132,10 @@ def analyze_forming(closed, forming, period, now, *, max_age_seconds=2.0, role=N
         return dict(result, current=True, status="history_gap", reason="closed_history_gap",
                     live_price=price, candle=candle)
     closes = [float(bar["close"]) for bar in bars] + [price]
-    fast_period, slow_period = (20, 50) if role == "trend" else (9, 21)
-    fast, slow = ema(closes, fast_period), ema(closes, slow_period)
-    fast_value = fast[-1] if len(closes) >= fast_period else None
-    slow_value = slow[-1] if len(closes) >= slow_period else None
-    rsi = rsi_series(closes)
-    rsi_value, previous_rsi = rsi[-1], rsi[-2] if len(rsi) > 1 else None
-    rsi_direction = "unavailable"
-    if rsi_value is not None and previous_rsi is not None:
-        rsi_direction = ("rising" if rsi_value > previous_rsi else
-                         "falling" if rsi_value < previous_rsi else "flat")
+    ema8 = ema(closes, 8)
     indicators = {
-        f"ema{fast_period}": fast_value, f"ema{slow_period}": slow_value,
-        "rsi14": rsi_value, "rsi14_previous_closed": previous_rsi,
-        "rsi_direction": rsi_direction, "includes_forming_close": True,
+        "ema8": ema8[-1] if len(closes) >= 8 else None,
+        "includes_forming_close": True,
     }
     highs, lows = confirmed_swings(bars)
     high_label, low_label = _progression(highs, "HH", "LH"), _progression(lows, "HL", "LL")
@@ -164,32 +154,9 @@ def analyze_forming(closed, forming, period, now, *, max_age_seconds=2.0, role=N
         "support_distance": price - support if support is not None else None,
         "levels_from_confirmed_swings_only": True,
     }
-    conditions = {
-        "price_above_fast_ema": price > fast_value if fast_value is not None else None,
-        "fast_ema_above_slow_ema": fast_value > slow_value if slow_value is not None else None,
-        "rsi14_in_buy_band_50_65": 50 <= rsi_value <= 65 if rsi_value is not None else None,
-        "rsi14_rising": rsi_direction == "rising" if rsi_direction != "unavailable" else None,
-    }
-    if role == "trend":
-        conditions["ema20_and_ema50_rising_three_bars"] = (
-            fast[-1] > fast[-4] and slow[-1] > slow[-4] if len(closes) >= 53 else None)
-    else:
-        conditions.update({
-            "price_above_ema21": price > slow_value if slow_value is not None else None,
-            "pullback_closes_above_own_ema21": (
-                all(value >= average for value, average in zip(closes[-5:], slow[-5:]))
-                if slow_value is not None else None),
-            "confirmed_higher_lows": low_label == "HL" if low_label else None,
-            "price_breaks_confirmed_swing_high": price > highs[-1]["price"] if highs else None,
-            "price_breaks_previous_high": price > bars[-1]["high"] if bars else None,
-            "low_above_prior_swing_low": low > lows[-2]["price"] if len(lows) >= 2 and not partial else None,
-            "range_within_twice_previous_ten": (
-                high - low <= 2 * sum(bar["high"] - bar["low"] for bar in bars[-10:]) / 10
-                if len(bars) >= 10 and not partial else None),
-        })
     return dict(result, current=True, status="partial" if partial else "provisional",
                 reason="partial_forming_candle" if partial else "awaiting_candle_close",
                 live_price=price, candle=candle, indicators=indicators,
                 confirmed_structure=structure,
                 swing_candidates=_candidate_swings(bars, current, highs, lows),
-                support_resistance=levels, provisional_conditions=conditions)
+                support_resistance=levels)
