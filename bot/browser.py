@@ -20,6 +20,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PWTimeout
 
@@ -31,6 +32,7 @@ log = logging.getLogger("browser")
 ROOT = Path(__file__).resolve().parents[1]
 SESSION_FILE = os.path.join(ROOT, "data", "session.json")
 SCREENSHOT_DIR = os.path.join(settings.LOG_DIR, "screenshots")
+PLATFORM_URL = getattr(settings, "PLATFORM_URL", "https://olymptrade.com/platform")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
 
@@ -108,6 +110,70 @@ class OlymtradeBot:
     async def __aexit__(self, *_):
         await self.stop()
 
+    def _page_origin(self, page=None):
+        page = page or self._page
+        if page is None:
+            return ""
+        try:
+            if page.is_closed():
+                return "about:blank"
+            return page.url or "about:blank"
+        except Exception:
+            return "about:blank"
+
+    def _attach_page_handlers(self, page: Optional[Page]) -> None:
+        if page is None:
+            return
+
+        def _on_ws(socket):
+            socket.on("framereceived", self._receive_market_frame)
+            socket.on("close", lambda *args: log.warning(
+                "[FeedWS] drop ts=%s close_code=%s close_reason=%s",
+                datetime.utcnow().isoformat(timespec="seconds"),
+                args[0] if args else "unknown",
+                args[1] if len(args) > 1 else "unknown",
+            ))
+            socket.on("error", lambda exc: log.warning(
+                "[FeedWS] drop ts=%s close_code=%s close_reason=%s",
+                datetime.utcnow().isoformat(timespec="seconds"), "error", str(exc),
+            ))
+
+        def _on_response(response):
+            return None
+
+        def _on_console(message):
+            return None
+
+        page.on("websocket", _on_ws)
+        page.on("response", _on_response)
+        page.on("console", _on_console)
+        page.on("pageerror", lambda exc: log.warning("[Feed] page_error %s", exc))
+
+    async def _init_platform_page(self, asset: Optional[str] = None, timeout: float = 30.0) -> bool:
+        asset = asset or settings.ASSET
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            page = self._page
+            if page is None or page.is_closed():
+                return False
+            url = self._page_origin(page)
+            if url == "about:blank" or not url.startswith(urlparse(PLATFORM_URL).scheme + "://"):
+                try:
+                    await page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
+                except Exception:
+                    return False
+            if await self.login():
+                try:
+                    if await self.select_asset(asset):
+                        await self._ensure_chart_visible_and_close_panels()
+                        quote = await self.get_current_quote(asset)
+                        if quote is not None and self._quote_is_fresh(quote):
+                            return True
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+        return False
+
     async def start(self):
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
@@ -125,7 +191,7 @@ class OlymtradeBot:
             self._ctx = await self._browser.new_context(viewport={"width": 1366, "height": 768})
 
         self._page = await self._ctx.new_page()
-        self._page.on("websocket", lambda socket: socket.on("framereceived", self._receive_market_frame))
+        self._attach_page_handlers(self._page)
         await self._page.add_init_script("""(() => {
             const NativeSocket = window.WebSocket;
             window.__tgHistorySockets = [];
@@ -145,6 +211,10 @@ class OlymtradeBot:
             };
         })();""")
         await self._page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        await self._page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
+        started = await self._init_platform_page(timeout=60.0)
+        if not started or self._page_origin(self._page) == "about:blank":
+            await self._page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
 
     async def stop(self):
         if self._ctx:
