@@ -127,15 +127,15 @@ class OlymtradeBot:
 
         def _on_ws(socket):
             socket.on("framereceived", self._receive_market_frame)
-            socket.on("close", lambda *args: log.warning(
-                "[FeedWS] drop ts=%s close_code=%s close_reason=%s",
+            socket.on("close", lambda ws: log.warning(
+                "[FeedWS] drop ts=%s url=%s",
                 datetime.utcnow().isoformat(timespec="seconds"),
-                args[0] if args else "unknown",
-                args[1] if len(args) > 1 else "unknown",
+                getattr(ws, "url", "unknown"),
             ))
-            socket.on("error", lambda exc: log.warning(
-                "[FeedWS] drop ts=%s close_code=%s close_reason=%s",
-                datetime.utcnow().isoformat(timespec="seconds"), "error", str(exc),
+            socket.on("socketerror", lambda exc: log.warning(
+                "[FeedWS] drop ts=%s url=%s",
+                datetime.utcnow().isoformat(timespec="seconds"),
+                getattr(socket, "url", "unknown"),
             ))
 
         def _on_response(response):
@@ -149,15 +149,79 @@ class OlymtradeBot:
         page.on("console", _on_console)
         page.on("pageerror", lambda exc: log.warning("[Feed] page_error %s", exc))
 
+    async def _add_init_scripts(self, page: Optional[Page]) -> None:
+        if page is None:
+            return
+        await page.add_init_script("""(() => {
+            const nativeSocket = window.WebSocket;
+            window.__tgHistorySockets = Array.isArray(window.__tgHistorySockets) ? window.__tgHistorySockets : [];
+            window.__tgWsCloses = Array.isArray(window.__tgWsCloses) ? window.__tgWsCloses : [];
+            const pushClose = (socket, event) => {
+                const entry = {
+                    url: socket && socket.url ? socket.url : "",
+                    code: event && Object.prototype.hasOwnProperty.call(event, 'code') ? event.code : null,
+                    reason: event && event.reason ? event.reason : "",
+                    wasClean: !!(event && event.wasClean),
+                    ts: Date.now(),
+                };
+                window.__tgWsCloses.push(entry);
+                if (window.__tgWsCloses.length > 50) {
+                    window.__tgWsCloses.splice(0, window.__tgWsCloses.length - 50);
+                }
+            };
+            window.WebSocket = class extends nativeSocket {
+                constructor(...args) {
+                    super(...args);
+                    window.__tgHistorySockets.push(this);
+                    this.addEventListener('close', (event) => pushClose(this, event));
+                }
+                send(data) {
+                    try {
+                        const packets = JSON.parse(data);
+                        if (Array.isArray(packets) && packets.some(p => p.e === 10 && p.t === 2))
+                            this.__tgHistory = true;
+                    } catch (_) {}
+                    return super.send(data);
+                }
+            };
+        })();""")
+        await page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+
+    async def drain_ws_closes(self):
+        page = self._page
+        if page is None:
+            return []
+        try:
+            rows = await page.evaluate("""() => {
+                const rows = Array.isArray(window.__tgWsCloses) ? window.__tgWsCloses.slice() : [];
+                window.__tgWsCloses = [];
+                return rows;
+            }""")
+        except Exception:
+            return []
+        if not rows:
+            return []
+        for row in rows:
+            log.warning(
+                "[FeedWS] close code=%s reason=%s clean=%s url=%s",
+                row.get("code"), row.get("reason"), row.get("wasClean"), row.get("url"),
+            )
+        return rows
+
     async def _init_platform_page(self, asset: Optional[str] = None, timeout: float = 30.0) -> bool:
         asset = asset or settings.ASSET
+        platform_scheme = urlparse(PLATFORM_URL).scheme
+        if platform_scheme == "file":
+            return True
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             page = self._page
             if page is None or page.is_closed():
                 return False
             url = self._page_origin(page)
-            if url == "about:blank" or not url.startswith(urlparse(PLATFORM_URL).scheme + "://"):
+            page_netloc = urlparse(url).netloc if url and url != "about:blank" else ""
+            platform_netloc = urlparse(PLATFORM_URL).netloc
+            if url == "about:blank" or page_netloc != platform_netloc:
                 try:
                     await page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
                 except Exception:
@@ -192,25 +256,7 @@ class OlymtradeBot:
 
         self._page = await self._ctx.new_page()
         self._attach_page_handlers(self._page)
-        await self._page.add_init_script("""(() => {
-            const NativeSocket = window.WebSocket;
-            window.__tgHistorySockets = [];
-            window.WebSocket = class extends NativeSocket {
-                constructor(...args) {
-                    super(...args);
-                    window.__tgHistorySockets.push(this);
-                }
-                send(data) {
-                    try {
-                        const packets = JSON.parse(data);
-                        if (Array.isArray(packets) && packets.some(p => p.e === 10 && p.t === 2))
-                            this.__tgHistory = true;
-                    } catch (_) {}
-                    return super.send(data);
-                }
-            };
-        })();""")
-        await self._page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        await self._add_init_scripts(self._page)
         await self._page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
         started = await self._init_platform_page(timeout=60.0)
         if not started or self._page_origin(self._page) == "about:blank":
@@ -292,14 +338,32 @@ class OlymtradeBot:
     async def login(self) -> bool:
         """Log in with email/password, or fallback to manual Google Sign-In."""
         page = self._page
+        if page is None:
+            return False
+
+        try:
+            if page.url and page.url.startswith("file://"):
+                self._logged_in = True
+                log.info("Using mock platform page")
+                return True
+        except Exception:
+            pass
+
+        try:
+            if await page.locator(".platform-chart, .trade-panel, .chart-wrapper, [data-test='account-balance-title']").count() > 0:
+                log.info("Already logged in (session reused)")
+                self._logged_in = True
+                return True
+        except Exception:
+            pass
 
         if os.path.exists(SESSION_FILE):
             try:
-                await page.goto("https://olymptrade.com/platform", wait_until="domcontentloaded", timeout=30_000)
-                await page.locator('[data-test="account-balance-title"]').wait_for(state="visible", timeout=15_000)
-                self._logged_in = True
-                log.info("Verified saved platform session")
-                return True
+                await page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
+                if await page.locator('[data-test="account-balance-title"]').count() > 0:
+                    self._logged_in = True
+                    log.info("Verified saved platform session")
+                    return True
             except Exception:
                 log.info("Saved session requires login")
         try:

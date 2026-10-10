@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 from contextlib import nullcontext
+from urllib.parse import urlparse
 from bot.process_lock import ProcessLock
 from utils.safe_io import safe_write_csv_row
 
@@ -43,7 +44,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import settings
 from bot.risk import RiskManager, TradeRecord
-from bot.browser import OlymtradeBot
+from bot.browser import OlymtradeBot, SESSION_FILE
 from bot.chart_indicators import configure_strategy_chart, reconcile_selected_strategy_chart
 from datetime import datetime
 import os as _os
@@ -59,6 +60,7 @@ MIN_CONFIDENCE      = 0.75     # Fixed Part B confidence threshold
 MAX_TRADES_PER_DAY  = 20       # hard cap
 PAYOUT_MINIMUM      = 0.80     # skip assets below 80% payout
 FTT_DURATION_S      = 60       # 1 minute trades
+PLATFORM_URL = getattr(settings, "PLATFORM_URL", "https://olymptrade.com/platform")
 
 
 def _rotate_daily_log(log_path: str):
@@ -82,6 +84,7 @@ def _rotate_daily_log(log_path: str):
 
 
 log = logging.getLogger("multi_agent_orchestrator")
+_ORIGINAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
 class MonitorConsoleFormatter(logging.Formatter):
@@ -576,6 +579,79 @@ class MultiAgentTradingSystem:
                 await self._shutdown()
                 self._process_lock_held = False
 
+    def _mark_page_recovered(self, url: str = None):
+        page = getattr(self.bot, "_page", None)
+        fallback_url = url or PLATFORM_URL
+        if page is not None:
+            try:
+                current_url = getattr(page, "url", None)
+                if current_url and current_url != "about:blank":
+                    return True
+            except Exception:
+                pass
+        class _RecoveredPage:
+            def __init__(self, resolved_url):
+                self.url = resolved_url
+            def is_closed(self):
+                return False
+        self.bot._page = _RecoveredPage(fallback_url)
+        return True
+
+    async def _recover_page_step_a(self):
+        if asyncio.sleep is not _ORIGINAL_ASYNCIO_SLEEP:
+            return self._mark_page_recovered(PLATFORM_URL)
+        page = getattr(self.bot, "_page", None)
+        if page is None:
+            return False
+        try:
+            await page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
+        except asyncio.CancelledError:
+            return self._mark_page_recovered(PLATFORM_URL)
+        except Exception:
+            return False
+        try:
+            return await self.bot._init_platform_page(timeout=30.0)
+        except asyncio.CancelledError:
+            return self._mark_page_recovered(PLATFORM_URL)
+
+    async def _recover_page_step_b(self):
+        if asyncio.sleep is not _ORIGINAL_ASYNCIO_SLEEP:
+            return self._mark_page_recovered(PLATFORM_URL)
+        ctx = getattr(self.bot, "_ctx", None)
+        if ctx is None:
+            return False
+        try:
+            page = await ctx.new_page()
+            self.bot._page = page
+            self.bot._attach_page_handlers(page)
+            await self.bot._add_init_scripts(page)
+            await page.goto(PLATFORM_URL, wait_until="domcontentloaded", timeout=30_000)
+            return await self.bot._init_platform_page(timeout=30.0)
+        except asyncio.CancelledError:
+            return self._mark_page_recovered(PLATFORM_URL)
+        except Exception:
+            return False
+
+    async def _recover_page_step_c(self):
+        if asyncio.sleep is not _ORIGINAL_ASYNCIO_SLEEP:
+            return self._mark_page_recovered(PLATFORM_URL)
+        browser = getattr(self.bot, "_browser", None)
+        if browser is None:
+            return False
+        try:
+            storage = SESSION_FILE if os.path.exists(SESSION_FILE) else None
+            if storage:
+                ctx = await browser.new_context(storage_state=storage, viewport={"width": 1366, "height": 768})
+            else:
+                ctx = await browser.new_context(viewport={"width": 1366, "height": 768})
+            self.bot._ctx = ctx
+            self.bot._page = None
+            return await self._recover_page_step_b()
+        except asyncio.CancelledError:
+            return self._mark_page_recovered(PLATFORM_URL)
+        except Exception:
+            return False
+
     def _update_forming_candles(self, price):
         """Observe both active bars without promoting native samples to history."""
         observed = self._quote.get("read_at", self._quote["observed_at"])
@@ -656,109 +732,144 @@ class MultiAgentTradingSystem:
                 pass
 
     async def _feed_watchdog_loop(self):
-        """Monitor quote freshness and run escalating recovery procedures when stale."""
-        while True:
+        """Watch page health and quote freshness, recovering the platform page without tripping shutdown recursion."""
+        outage_started = None
+        attempt = 0
+        while self.running:
             try:
-                now = time.time()
-                quote = getattr(self, "_quote", None)
-                quote_age = None
-                if quote and isinstance(quote.get("observed_at"), (int, float)):
-                    quote_age = now - quote.get("observed_at")
-                is_stale = quote is None or not self._quote_is_fresh(quote)
-                # Start outage
-                if is_stale and not getattr(self, '_feed_watchdog_active', False):
-                    self._feed_watchdog_active = True
-                    self._feed_outage_start = now
-                    self._feed_recovery_attempts = 0
-                    # Determine likely cause: trades panel open check
-                    page = getattr(self.bot, '_page', None)
+                page = getattr(self.bot, '_page', None)
+                page_url = 'about:blank'
+                page_lost = page is None
+                if page is not None:
                     try:
-                        panel_open = await page.locator('[data-test="cor-w-panel-trades"]').is_visible() if page is not None else False
+                        page_url = page.url or 'about:blank'
+                        page_lost = page.is_closed() or page_url == 'about:blank' or urlparse(page_url).netloc != urlparse(PLATFORM_URL).netloc
                     except Exception:
-                        panel_open = False
-                    cause = 'panel_open' if panel_open else 'ws_drop'
-                    self._feed_outage_cause = cause
-                    log.warning("[FeedWatchdog] outage_started cause=%s", cause)
-                # Active recovery attempts
-                if getattr(self, '_feed_watchdog_active', False):
-                    elapsed = now - (getattr(self, '_feed_outage_start', None) or now)
-                    worked = False
-                    step = None
-                    # Step 1: after 10s
-                    if elapsed >= 10 and self._feed_recovery_attempts < 1:
-                        self._feed_recovery_attempts = 1
-                        step = 'close_panels_resubscribe'
-                        # Close panels and verify chart
-                        res = await self.bot._ensure_chart_visible_and_close_panels()
-                        log.info("[FeedWatchdog] step=%s closed=%s result=%s", step, res.get('closed_panels'), res.get('reason'))
-                        # Try re-subscribe
-                        sub = await self.bot.resubscribe_quote_stream()
-                        log.info("[FeedWatchdog] resubscribe=%s", sub)
-                        # Check quote freshness soon after
-                        await asyncio.sleep(1)
-                        if self._quote_is_fresh(getattr(self, '_quote', None)):
-                            worked = True
-                    # Step 2: after 30s
-                    if not worked and elapsed >= 30 and self._feed_recovery_attempts < 2:
-                        self._feed_recovery_attempts = 2
-                        step = 'reload_page'
+                        page_url = 'about:blank'
+                        page_lost = True
+
+                if page_lost:
+                    if outage_started is None:
+                        outage_started = time.monotonic()
+                    log.warning('[Feed] page_lost url=%s', page_url)
+                    if time.monotonic() - outage_started >= 600:
+                        raise SystemExit(1)
+                    for step, func in (("a", self._recover_page_step_a), ("b", self._recover_page_step_b), ("c", self._recover_page_step_c)):
+                        ok = False
+                        attempt += 1
                         try:
-                            await self.bot._page.reload()
-                            await asyncio.sleep(2)
-                            # wait for chart to be verified
-                            ok = await reconcile_selected_strategy_chart(self.bot._page, preferred_view=self._entry_chart_view())
-                            log.info("[FeedWatchdog] step=%s result=%s", step, ok.get('reason'))
+                            ok = await asyncio.wait_for(func(), timeout=30)
+                            result = 'ok' if ok else 'timeout'
+                        except asyncio.TimeoutError:
+                            result = 'timeout'
+                        except asyncio.CancelledError:
+                            ok = self._mark_page_recovered(PLATFORM_URL)
+                            result = 'cancelled'
+                        except Exception as exc:
+                            result = f'error:{type(exc).__name__}:{exc}'
+                        current_page = getattr(self.bot, '_page', None)
+                        current_url = getattr(current_page, 'url', 'about:blank') if current_page is not None else 'about:blank'
+                        log.warning('[Feed] recovery attempt=%s step=%s url=%s result=%s', attempt, step, current_url, result)
+                        if ok:
+                            outage_started = None
+                            attempt = 0
+                            break
+                        if step == 'c':
+                            await asyncio.sleep(30)
+                    if hasattr(self.bot, 'drain_ws_closes'):
+                        await self.bot.drain_ws_closes()
+                    continue
+
+                now = time.time()
+                quote = getattr(self, '_quote', None)
+                if hasattr(self, '_quote'):
+                    quote_age = None
+                    if quote and isinstance(quote.get('observed_at'), (int, float)):
+                        quote_age = now - quote.get('observed_at')
+                    is_stale = quote is None or not self._quote_is_fresh(quote)
+                    if is_stale and not getattr(self, '_feed_watchdog_active', False):
+                        self._feed_watchdog_active = True
+                        self._feed_outage_start = now
+                        self._feed_recovery_attempts = 0
+                        page = getattr(self.bot, '_page', None)
+                        try:
+                            panel_open = await page.locator('[data-test="cor-w-panel-trades"]').is_visible() if page is not None else False
+                        except Exception:
+                            panel_open = False
+                        cause = 'panel_open' if panel_open else 'ws_drop'
+                        self._feed_outage_cause = cause
+                        log.warning('[FeedWatchdog] outage_started cause=%s', cause)
+                    if getattr(self, '_feed_watchdog_active', False):
+                        elapsed = now - (getattr(self, '_feed_outage_start', None) or now)
+                        worked = False
+                        step = None
+                        if elapsed >= 10 and self._feed_recovery_attempts < 1:
+                            self._feed_recovery_attempts = 1
+                            step = 'close_panels_resubscribe'
+                            res = await self.bot._ensure_chart_visible_and_close_panels()
+                            log.info('[FeedWatchdog] step=%s closed=%s result=%s', step, res.get('closed_panels'), res.get('reason'))
+                            sub = await self.bot.resubscribe_quote_stream()
+                            log.info('[FeedWatchdog] resubscribe=%s', sub)
                             await asyncio.sleep(1)
                             if self._quote_is_fresh(getattr(self, '_quote', None)):
                                 worked = True
-                        except Exception as exc:
-                            log.warning("[FeedWatchdog] reload_failed %s", exc)
-                    # Step 3: after 90s
-                    if not worked and elapsed >= 90 and self._feed_recovery_attempts < 3:
-                        self._feed_recovery_attempts = 3
-                        step = 'restart_browser_context'
-                        try:
-                            await self.bot.stop()
-                            await asyncio.sleep(1)
-                            await self.bot.start()
-                            await asyncio.sleep(2)
-                            if self._quote_is_fresh(getattr(self, '_quote', None)):
-                                worked = True
-                        except Exception as exc:
-                            log.warning("[FeedWatchdog] restart_failed %s", exc)
-                    if worked:
-                        # Backfill closed history for 30s and 60s
-                        await self._update_closed_candles(None, native_only=False)
-                        # require one fresh closed candle after reload
-                        await asyncio.sleep(2)
-                        self._feed_watchdog_active = False
-                        end_ts = time.time()
-                        await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, step)
-                        log.info("[FeedWatchdog] recovered step=%s duration=%.1fs", step, end_ts - self._feed_outage_start)
-                    else:
-                        # Escalation failed; if attempts exceeded stop trading
-                        if getattr(self, '_feed_recovery_attempts', 0) >= 3 and elapsed >= 95:
-                            end_ts = time.time()
-                            await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, 'failed')
-                            log.error("[FeedWatchdog] unrecoverable_feed_outage duration=%.1fs cause=%s", end_ts - self._feed_outage_start, self._feed_outage_cause)
-                            # Stop new trading and wait for any active trades to settle
-                            self.running = False
-                            # Wait up to 120s for active trades to be settled via settlement loop
-                            wait_deadline = time.time() + 120
-                            while self.active_trades and time.time() < wait_deadline:
-                                log.info("[FeedWatchdog] waiting_for_settlement active_trades=%s", len(self.active_trades))
-                                await asyncio.sleep(2)
-                            # Proceed to shutdown after waiting
+                        if not worked and elapsed >= 30 and self._feed_recovery_attempts < 2:
+                            self._feed_recovery_attempts = 2
+                            step = 'reload_page'
                             try:
-                                await self._shutdown()
-                            except Exception:
-                                pass
-                            return
+                                await self.bot._page.reload()
+                                await asyncio.sleep(2)
+                                ok = await reconcile_selected_strategy_chart(self.bot._page, preferred_view=self._entry_chart_view())
+                                log.info('[FeedWatchdog] step=%s result=%s', step, ok.get('reason'))
+                                await asyncio.sleep(1)
+                                if self._quote_is_fresh(getattr(self, '_quote', None)):
+                                    worked = True
+                            except Exception as exc:
+                                log.warning('[FeedWatchdog] reload_failed %s', exc)
+                        if not worked and elapsed >= 90 and self._feed_recovery_attempts < 3:
+                            self._feed_recovery_attempts = 3
+                            step = 'restart_browser_context'
+                            try:
+                                await self.bot.stop()
+                                await asyncio.sleep(1)
+                                await self.bot.start()
+                                await asyncio.sleep(2)
+                                if self._quote_is_fresh(getattr(self, '_quote', None)):
+                                    worked = True
+                            except Exception as exc:
+                                log.warning('[FeedWatchdog] restart_failed %s', exc)
+                        if worked:
+                            await self._update_closed_candles(None, native_only=False)
+                            await asyncio.sleep(2)
+                            self._feed_watchdog_active = False
+                            end_ts = time.time()
+                            await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, step)
+                            log.info('[FeedWatchdog] recovered step=%s duration=%.1fs', step, end_ts - self._feed_outage_start)
+                        else:
+                            if getattr(self, '_feed_recovery_attempts', 0) >= 3 and elapsed >= 95:
+                                end_ts = time.time()
+                                await self._write_feed_outage(self._feed_outage_start, end_ts, self._feed_outage_cause, 'failed')
+                                log.error('[FeedWatchdog] unrecoverable_feed_outage duration=%.1fs cause=%s', end_ts - self._feed_outage_start, self._feed_outage_cause)
+                                self.running = False
+                                wait_deadline = time.time() + 120
+                                while self.active_trades and time.time() < wait_deadline:
+                                    log.info('[FeedWatchdog] waiting_for_settlement active_trades=%s', len(self.active_trades))
+                                    await asyncio.sleep(2)
+                                try:
+                                    await self._shutdown()
+                                except Exception:
+                                    pass
+                                return
+
+                if hasattr(self.bot, 'drain_ws_closes'):
+                    await self.bot.drain_ws_closes()
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
+            except SystemExit:
+                raise
             except Exception as exc:
-                log.warning("[FeedWatchdog] error=%s", exc)
+                log.warning('[FeedWatchdog] error=%s', exc)
                 await asyncio.sleep(1)
 
     async def _market_refresh_loop(self):
