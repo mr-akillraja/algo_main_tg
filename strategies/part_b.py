@@ -65,6 +65,8 @@ REPORT_FIELDS = (
     "Lower-Timeframe Consensus", "Signal", "Confidence", "Expiry",
     "Entry Reason", "Invalidation Reason",
 )
+STRATEGY_MODE = "rsi_cross"
+CONFIDENCE_THRESHOLD = 75
 
 
 class _Unavailable(ValueError):
@@ -344,13 +346,26 @@ def evaluate_strategy(candles_by_timeframe: Mapping[int, Sequence[dict]], *, tim
                       current_price: float | None, asset: str, signal_price: float | None = None,
                       indicators: dict | None = None, session_high: float | None = None,
                       session_low: float | None = None) -> dict:
-    """Evaluate seven hard gates and return a signal, diagnostics and exact report.
+    """Evaluate the active strategy and return a signal, diagnostics and exact report.
 
-    Evaluation stops at the first failed gate. Supplied indicators are trusted
-    as values, but must be finite and positive; their history is still required
-    wherever a historical comparison is specified. This function never executes
-    trades, changes candle inputs or updates strategy parameters.
+    The legacy seven-gate Part B path remains below; strategy mode can switch to
+    the RSI crossover route while preserving the same return contract.
     """
+    if STRATEGY_MODE == "rsi_cross":
+        if not getattr(log, "_rsi_cross_startup_logged", False):
+            log.info("[Strategy] active=rsi_cross")
+            log._rsi_cross_startup_logged = True
+        import strategies.rsi_cross as rsi_cross_module
+        return rsi_cross_module.rsi_cross_signal(
+            candles_by_timeframe=candles_by_timeframe,
+            timestamp=timestamp,
+            current_price=current_price,
+            asset=asset,
+            signal_price=signal_price,
+            indicators=indicators,
+            session_high=session_high,
+            session_low=session_low,
+        )
     fields = dict.fromkeys(REPORT_FIELDS, "unavailable")
     fields.update({"Asset": _safe_text(asset), "Current Price": current_price if _positive(current_price) else "unavailable",
                    "Expiry": "1 MINUTE", "Breakout Detected": "no", "Retest Detected": "no",
@@ -369,8 +384,8 @@ def evaluate_strategy(candles_by_timeframe: Mapping[int, Sequence[dict]], *, tim
 
     def finish(gate=None, detail=None, side=None):
         confidence = min(100, math.floor(sum(metrics["component_scores"].values()) + 1e-9))
-        if gate is None and confidence < 75:
-            gate, detail = "confidence", f"score {confidence} is below 75"
+        if gate is None and confidence < CONFIDENCE_THRESHOLD:
+            gate, detail = "confidence", f"score {confidence} is below {CONFIDENCE_THRESHOLD}"
         signal = "NO TRADE" if gate is not None else ("CALL" if side == 1 else "PUT")
         reason = (f"Gate {gate} failed: {detail}" if isinstance(gate, int)
                   else f"Confidence failed: {detail}" if gate == "confidence"
