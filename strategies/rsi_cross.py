@@ -89,8 +89,8 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
     entry_closed_ts = _mapping_value(indicators, "entry_closed_ts")
     already_signalled = bool(_mapping_value(indicators, "already_signalled"))
     last_signal_ts = _mapping_value(indicators, "last_signal_ts", "signal_ts")
-    rsi_prev = 50.0
-    rsi_now = 50.0
+    rsi_prev = None
+    rsi_now = None
 
     try:
         minutes = part_b._closed(candles_by_timeframe.get(60), 60, timestamp)
@@ -98,14 +98,14 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         minutes = []
     have = len(minutes)
 
-    if have < MIN_CANDLES:
-        reason = f"warmup have={have} need={MIN_CANDLES}"
+    if current_price is None:
+        reason = "no_price"
         signal = "NO TRADE"
         confidence = 0
         entry_reason = reason
         invalidation_reason = reason
-    elif quote_status != "fresh":
-        reason = "stale_quote"
+    elif have < MIN_CANDLES:
+        reason = f"warmup have={have} need={MIN_CANDLES}"
         signal = "NO TRADE"
         confidence = 0
         entry_reason = reason
@@ -116,24 +116,22 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         confidence = 0
         entry_reason = reason
         invalidation_reason = reason
-    elif entry_closed_ts is not None and (already_signalled or last_signal_ts == entry_closed_ts):
-        reason = "already_signalled"
-        signal = "NO TRADE"
-        confidence = 0
-        entry_reason = reason
-        invalidation_reason = reason
     else:
         closes = [float(bar["close"]) for bar in minutes]
         values = _wilder_rsi(closes)
-        rsi_prev = float(values[-2]) if len(values) >= 2 else 50.0
-        rsi_now = float(values[-1]) if values else 50.0
-        if rsi_prev < BUY_LEVEL and rsi_now >= BUY_LEVEL:
+        if len(values) >= 2:
+            rsi_prev = float(values[-2])
+            rsi_now = float(values[-1])
+        elif values:
+            rsi_now = float(values[-1])
+
+        if rsi_prev is not None and rsi_now is not None and rsi_prev < BUY_LEVEL and rsi_now >= BUY_LEVEL:
             signal = "CALL"
             confidence = min(100, base_confidence + 5)
             reason = f"RSI14 crossed up through 35 (prev={rsi_prev:.2f} now={rsi_now:.2f})"
             entry_reason = reason
             invalidation_reason = legacy.get("fields", {}).get("Invalidation Reason", "Entry expires after second 15 or a price drift above 0.15 ATR")
-        elif rsi_prev > SELL_LEVEL and rsi_now <= SELL_LEVEL:
+        elif rsi_prev is not None and rsi_now is not None and rsi_prev > SELL_LEVEL and rsi_now <= SELL_LEVEL:
             signal = "PUT"
             confidence = min(100, base_confidence + 5)
             reason = f"RSI14 crossed down through 65 (prev={rsi_prev:.2f} now={rsi_now:.2f})"
@@ -146,6 +144,13 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
             entry_reason = reason
             invalidation_reason = reason
 
+        if entry_closed_ts is not None and (already_signalled or last_signal_ts == entry_closed_ts):
+            reason = "already_signalled"
+            signal = "NO TRADE"
+            confidence = 0
+            entry_reason = reason
+            invalidation_reason = reason
+
     fields.update({
         "Signal": signal,
         "Confidence": confidence,
@@ -153,10 +158,13 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         "Invalidation Reason": invalidation_reason,
     })
     report = "\n".join(f"{name}: {fields.get(name, 'unavailable')}" for name in part_b.REPORT_FIELDS)
-    report += (
-        f"\nDecision: 1m.RSI.closed={rsi_now:.2f} strategy=rsi_cross "
-        f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f}"
-    )
+    if rsi_prev is not None and rsi_now is not None:
+        report += (
+            f"\nDecision: 1m.RSI.closed={rsi_now:.2f} strategy=rsi_cross "
+            f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f}"
+        )
+    else:
+        report += "\nDecision: 1m.RSI.closed=? strategy=rsi_cross rsi_prev=? rsi_now=?"
 
     return {
         "signal": signal,
@@ -165,8 +173,8 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         "reason": reason,
         "report": report,
         "fields": fields,
-        "metrics": {"rsi_prev": float(rsi_prev) if 'rsi_prev' in locals() else 50.0,
-                     "rsi_now": float(rsi_now) if 'rsi_now' in locals() else 50.0,
+        "metrics": {"rsi_prev": rsi_prev,
+                     "rsi_now": rsi_now,
                      "quote_status": quote_status,
                      "entry_window": entry_window,
                      "entry_closed_ts": entry_closed_ts},

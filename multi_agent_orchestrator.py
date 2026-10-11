@@ -105,6 +105,12 @@ class MonitorConsoleFormatter(logging.Formatter):
                 timing = data.get("entry_timing", {})
                 window = {True: "open", False: "closed"}.get(timing.get("within_window"), "unknown")
                 stale_timeframes = ",".join(f"{period}s" for period in data.get("stale_closed_timeframes", [])) or "none"
+                strategy_rsi_now = data.get("rsi_now")
+                if strategy_rsi_now is None:
+                    strategy_rsi_now = (data.get("strategy_result") or {}).get("metrics", {}).get("rsi_now")
+                if strategy_rsi_now is None:
+                    strategy_rsi_now = gate.get("rsi_now")
+                rsi_display = f"{strategy_rsi_now:.2f}" if isinstance(strategy_rsi_now, (int, float)) else "?"
                 # Represent failed rules fully for easier debugging.
                 failed_rules = gate.get('failed_rules') or []
                 failed_rules_str = json.dumps(failed_rules)
@@ -131,7 +137,7 @@ class MonitorConsoleFormatter(logging.Formatter):
                         f"entry_closed_ts={data.get('entry_closed_ts') or gate.get('entry_closed_ts') or data.get('closed_candles', {}).get(str(entry_seconds), {}).get('open_ts')} "
                     f"entry_seconds={entry_seconds} "
                     f"entry_age_seconds={seconds(timing.get('age_seconds'))} entry_window={window} "
-                    f"{entry_label}.RSI.closed={number(gate.get('rsi'))} "
+                    f"{entry_label}.RSI.closed={rsi_display} "
                     f"{entry_label}.RSI.live={number(live_rsi)} "
                     f"5m={data.get('trend_filter_5m', {}).get('reason', 'unavailable')} "
                     f"failed_count={len(failed_rules)} failed_rules={failed_rules_str} "
