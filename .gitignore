@@ -3,3 +3,5 @@ logs/
 *.log
 data/session.json
 __pycache__/
+config/.env
+session_state.json
