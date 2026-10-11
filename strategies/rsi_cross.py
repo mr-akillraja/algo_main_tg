@@ -91,6 +91,7 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
     last_signal_ts = _mapping_value(indicators, "last_signal_ts", "signal_ts")
     rsi_prev = None
     rsi_now = None
+    cross = "none"
 
     try:
         minutes = part_b._closed(candles_by_timeframe.get(60), 60, timestamp)
@@ -110,12 +111,8 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         confidence = 0
         entry_reason = reason
         invalidation_reason = reason
-    elif entry_window != "open":
-        reason = "window_closed"
-        signal = "NO TRADE"
-        confidence = 0
-        entry_reason = reason
-        invalidation_reason = reason
+        rsi_prev = "n/a(warmup)"
+        rsi_now = "n/a(warmup)"
     else:
         closes = [float(bar["close"]) for bar in minutes]
         values = _wilder_rsi(closes)
@@ -126,21 +123,37 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
             rsi_now = float(values[-1])
 
         if rsi_prev is not None and rsi_now is not None and rsi_prev < BUY_LEVEL and rsi_now >= BUY_LEVEL:
+            cross = "BUY"
             signal = "CALL"
             confidence = min(100, base_confidence + 5)
             reason = f"RSI14 crossed up through 35 (prev={rsi_prev:.2f} now={rsi_now:.2f})"
             entry_reason = reason
             invalidation_reason = legacy.get("fields", {}).get("Invalidation Reason", "Entry expires after second 15 or a price drift above 0.15 ATR")
         elif rsi_prev is not None and rsi_now is not None and rsi_prev > SELL_LEVEL and rsi_now <= SELL_LEVEL:
+            cross = "SELL"
             signal = "PUT"
             confidence = min(100, base_confidence + 5)
             reason = f"RSI14 crossed down through 65 (prev={rsi_prev:.2f} now={rsi_now:.2f})"
             entry_reason = reason
             invalidation_reason = legacy.get("fields", {}).get("Invalidation Reason", "Entry expires after second 15 or a price drift above 0.15 ATR")
         else:
+            cross = "none"
             reason = "no_cross"
             signal = "NO TRADE"
             confidence = 0
+            entry_reason = reason
+            invalidation_reason = reason
+
+        if entry_window is None:
+            signal = "NO TRADE"
+            confidence = 0
+            reason = "no_window_info"
+            entry_reason = reason
+            invalidation_reason = reason
+        elif entry_window != "open":
+            signal = "NO TRADE"
+            confidence = 0
+            reason = "window_closed"
             entry_reason = reason
             invalidation_reason = reason
 
@@ -158,13 +171,21 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         "Invalidation Reason": invalidation_reason,
     })
     report = "\n".join(f"{name}: {fields.get(name, 'unavailable')}" for name in part_b.REPORT_FIELDS)
-    if rsi_prev is not None and rsi_now is not None:
+    if isinstance(rsi_prev, str) or isinstance(rsi_now, str):
         report += (
-            f"\nDecision: 1m.RSI.closed={rsi_now:.2f} strategy=rsi_cross "
-            f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f}"
+            f"\nDecision: 1m.RSI.closed=? strategy=rsi_cross cross={cross} "
+            "rsi_prev=n/a(warmup) rsi_now=n/a(warmup)"
+        )
+    elif rsi_prev is None or rsi_now is None:
+        report += (
+            f"\nDecision: 1m.RSI.closed=? strategy=rsi_cross cross={cross} "
+            "rsi_prev=? rsi_now=?"
         )
     else:
-        report += "\nDecision: 1m.RSI.closed=? strategy=rsi_cross rsi_prev=? rsi_now=?"
+        report += (
+            f"\nDecision: 1m.RSI.closed={rsi_now:.2f} strategy=rsi_cross cross={cross} "
+            f"rsi_prev={rsi_prev:.2f} rsi_now={rsi_now:.2f}"
+        )
 
     return {
         "signal": signal,
@@ -175,6 +196,7 @@ def rsi_cross_signal(candles_by_timeframe: Mapping[int, Sequence[dict]], *, time
         "fields": fields,
         "metrics": {"rsi_prev": rsi_prev,
                      "rsi_now": rsi_now,
+                     "cross": cross,
                      "quote_status": quote_status,
                      "entry_window": entry_window,
                      "entry_closed_ts": entry_closed_ts},

@@ -1027,9 +1027,12 @@ class MultiAgentTradingSystem:
         """Evaluate supplied history without altering or synthesizing market data."""
         histories = {period: builder.closed_snapshot()
                      for period, builder in self.agent1.builders.items()}
+        strategy_indicators = dict(getattr(self, "_strategy_indicators", {}) or {})
+        timing = self._monitor_context(histories.get(30, []), histories.get(60, []), current_price).get("entry_timing", {})
+        strategy_indicators["entry_window"] = {True: "open", False: "closed"}.get(timing.get("within_window"), "unknown")
         evaluation = evaluate_strategy(
             histories, timestamp=time.time(), current_price=current_price,
-            asset=self._current_asset)
+            asset=self._current_asset, indicators=strategy_indicators)
         # All evaluations, including missing histories, reach the existing logger.
         log.info("%s", evaluation["report"])
         # Log evaluation as a durable CSV row using safe_write_csv_row; don't block trading on I/O failures.
